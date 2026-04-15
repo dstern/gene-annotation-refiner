@@ -1486,33 +1486,42 @@ class ORFFinder:
 
     def find_best_orf(self, seqid: str, exons: List[Feature],
                       strand: str,
-                      min_orf_len: int = 150) -> Optional[Tuple[int, int, int]]:
+                      min_orf_len: int = 150,
+                      coverage=None) -> Optional[Tuple[int, int, int]]:
         """Find the best ORF in a transcript.
 
         Strategy: find the earliest ATG (in transcript coordinates, scanning
-        all three frames) that produces an ORF at least min_orf_len bp long.
-        'Earliest' is defined as the smallest transcript-coordinate start
-        position, so we honour the first ATG that gives a plausible protein
-        rather than the single longest ORF (which can be biased by spurious
-        long ORFs deep in the transcript).
+        all three frames) that produces an ORF at least min_orf_len bp long,
+        subject to coverage support at the ATG position.
+
+        When coverage is provided, ATG candidates with very low coverage at
+        their genomic start position (< COV_MIN_FRACTION of the
+        best-covered candidate) are excluded.  This prevents a spurious early
+        ATG in a poorly expressed / low-coverage region from being preferred
+        over the real translation start site that has strong RNA-seq support.
+
+        Among the coverage-passing candidates, the earliest start is chosen
+        (longest ORF as tiebreaker).
 
         Returns (orf_start, orf_end, frame) in 0-based transcript coordinates,
         or None. orf_end is the position after the last base of the stop codon
         (or transcript end for partial ORFs).
         """
+        # Fraction of the best-covered ATG below which a start is excluded.
+        COV_MIN_FRACTION = 0.10   # < 10% of best → filter out
+        COV_WINDOW = 30           # bp window around the ATG for coverage query
+
         tx_seq = self._extract_transcript_sequence(seqid, exons, strand)
         if not tx_seq or len(tx_seq) < 3:
             return None
 
-        # Collect all candidate ORFs (start, end, length) across all frames
+        # Collect all candidate ORFs (start, end, frame) across all frames
         candidates = []
         seq_len = len(tx_seq)
         for i in range(seq_len - 2):
             if tx_seq[i:i+3] != self.START_CODON:
                 continue
-            # Determine which reading frame this ATG is in
             frame = i % 3
-            # Scan for stop codon in this frame starting from i
             j = i + 3
             while j <= seq_len - 3:
                 c = tx_seq[j:j+3]
@@ -1523,7 +1532,6 @@ class ORFFinder:
                     break
                 j += 3
             else:
-                # No stop codon — partial ORF running to end of transcript
                 orf_len = seq_len - i
                 if orf_len >= min_orf_len:
                     candidates.append((i, seq_len, frame))
@@ -1531,10 +1539,60 @@ class ORFFinder:
         if not candidates:
             return None
 
+        # ── Coverage filter ────────────────────────────────────────────────
+        # If coverage is available, compute it at the genomic position of each
+        # ATG and exclude starts that are in very low-coverage regions.
+        if coverage is not None and getattr(coverage, 'available', True):
+            sorted_exons_fwd = sorted(exons, key=lambda e: e.start)
+            cov_scores = {}
+            for orf_start, _, _ in candidates:
+                g_pos = self._tx_pos_to_genomic(
+                    orf_start, sorted_exons_fwd, strand)
+                if g_pos is not None:
+                    win_s = max(1, g_pos - COV_WINDOW)
+                    win_e = g_pos + COV_WINDOW
+                    cov_scores[orf_start] = coverage.get_mean_coverage(
+                        seqid, win_s, win_e)
+                else:
+                    cov_scores[orf_start] = 0.0
+
+            max_cov = max(cov_scores.values()) if cov_scores else 0.0
+            if max_cov > 0:
+                threshold = max_cov * COV_MIN_FRACTION
+                candidates = [c for c in candidates
+                               if cov_scores.get(c[0], 0.0) >= threshold]
+
+        if not candidates:
+            return None
+
         # Sort by: (1) earliest start position, (2) longest ORF as tiebreaker
         candidates.sort(key=lambda x: (x[0], -(x[1] - x[0])))
-        best = candidates[0]
-        return best
+        return candidates[0]
+
+    def _tx_pos_to_genomic(self, tx_pos: int,
+                            sorted_exons_fwd: List[Feature],
+                            strand: str) -> Optional[int]:
+        """Convert a 0-based transcript position to a genomic position.
+
+        sorted_exons_fwd must be sorted by start (ascending) regardless of strand.
+        For '-' strand, transcript position 0 corresponds to the end of the last exon.
+        """
+        if strand == '-':
+            walk_exons = list(reversed(sorted_exons_fwd))
+        else:
+            walk_exons = sorted_exons_fwd
+
+        cum = 0
+        for exon in walk_exons:
+            exon_len = exon.end - exon.start + 1
+            if cum + exon_len > tx_pos:
+                offset = tx_pos - cum
+                if strand == '+':
+                    return exon.start + offset
+                else:
+                    return exon.end - offset
+            cum += exon_len
+        return None
 
     def _extract_transcript_sequence(self, seqid: str,
                                       exons: List[Feature],
@@ -1590,13 +1648,14 @@ class ORFFinder:
 
         return cds_features
 
-    def reassign_cds(self, gene: 'Gene') -> 'Gene':
-        """Re-derive CDS for all transcripts by finding the longest ORF."""
+    def reassign_cds(self, gene: 'Gene', coverage=None) -> 'Gene':
+        """Re-derive CDS for all transcripts by finding the best ORF."""
         for tx in gene.transcripts:
             if not tx.exons:
                 continue
 
-            orf = self.find_best_orf(gene.seqid, tx.exons, gene.strand)
+            orf = self.find_best_orf(gene.seqid, tx.exons, gene.strand,
+                                     coverage=coverage)
             if orf is None:
                 tx.cds = []
                 continue
@@ -4253,7 +4312,7 @@ class GeneAnnotationRefiner:
         for gene in consensus_genes:
             if gene.attributes.get('manual_annotation') == 'true':
                 continue
-            gene = orf_finder.reassign_cds(gene)
+            gene = orf_finder.reassign_cds(gene, coverage=self.coverage)
 
         # Step 5h: Split genes where isoforms have non-overlapping CDS
         logger.info("\nStep 5h: Splitting genes with non-overlapping CDS...")
@@ -5685,7 +5744,8 @@ class GeneAnnotationRefiner:
 
                 if (cds_starts_early and cds_ends_late) or cds_starts_late:
                     orf_finder = ORFFinder(self.genome)
-                    orf = orf_finder.find_best_orf(seqid, gene_exons, strand)
+                    orf = orf_finder.find_best_orf(seqid, gene_exons, strand,
+                                                   coverage=self.coverage)
                     if orf:
                         orf_start, orf_end, _ = orf
                         new_cds = orf_finder.orf_to_genomic_cds(
