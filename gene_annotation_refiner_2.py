@@ -5543,10 +5543,29 @@ class GeneAnnotationRefiner:
             # --- Terminal exon junction audit ---
             # Working inward from each end of the assembled transcript, drop
             # terminal exons whose connecting intron has zero junction reads.
-            # This is checked BEFORE CDS logic so that a spurious terminal
-            # exon (e.g. the bad first exon contributed by a template whose
-            # overall junction mean is high) is removed before CDS start
-            # position is evaluated.  Stop at the first supported intron.
+            # Also drop terminal exons where the connecting intron has very
+            # few reads (< TERMINAL_MIN_READS) AND the terminal exon coverage
+            # is much lower than the adjacent anchor exon (< TERMINAL_COV_RATIO).
+            # This removes rare-alternative-splice terminal exons that would
+            # otherwise beat the dominant high-coverage UTR-extended isoform
+            # in Phase 4 merely because they contribute one extra confirmed intron.
+            # Stop at the first exon that passes both checks.
+            TERMINAL_MIN_READS = 5      # below this, also check coverage ratio
+            TERMINAL_COV_RATIO = 0.10   # terminal exon must be > 10% of anchor cov
+
+            def _low_confidence_terminal(terminal_exon, anchor_exon, intron_reads):
+                """Return True if the terminal exon looks like a rare minor isoform."""
+                if intron_reads < 1:
+                    return True
+                if intron_reads < TERMINAL_MIN_READS:
+                    t_cov = self.coverage.get_mean_coverage(
+                        seqid, terminal_exon.start, terminal_exon.end)
+                    a_cov = self.coverage.get_mean_coverage(
+                        seqid, anchor_exon.start, anchor_exon.end)
+                    if a_cov > 1.0 and t_cov < a_cov * TERMINAL_COV_RATIO:
+                        return True
+                return False
+
             if gene_exons and self.bam_evidence.available:
                 _tx_order = sorted(gene_exons, key=lambda e: e.start)
 
@@ -5554,29 +5573,33 @@ class GeneAnnotationRefiner:
                 while len(_tx_order) > 1:
                     _is = _tx_order[0].end + 1
                     _ie = _tx_order[1].start - 1
-                    if _ie > _is and self.bam_evidence.count_spliced_reads(
-                            seqid, _is, _ie) < 1:
-                        logger.debug(
-                            f"  Terminal audit: dropping 5'-exon "
-                            f"{_tx_order[0].start}-{_tx_order[0].end} "
-                            f"({template.gene_id}, intron {_is}-{_ie}: 0 jct reads)")
-                        _tx_order.pop(0)
-                    else:
-                        break
+                    if _ie > _is:
+                        _reads = self.bam_evidence.count_spliced_reads(seqid, _is, _ie)
+                        if _low_confidence_terminal(_tx_order[0], _tx_order[1], _reads):
+                            logger.debug(
+                                f"  Terminal audit: dropping 5'-exon "
+                                f"{_tx_order[0].start}-{_tx_order[0].end} "
+                                f"({template.gene_id}, intron {_is}-{_ie}: "
+                                f"{_reads} jct reads)")
+                            _tx_order.pop(0)
+                            continue
+                    break
 
                 # Trim from 3' end (high index)
                 while len(_tx_order) > 1:
                     _is = _tx_order[-2].end + 1
                     _ie = _tx_order[-1].start - 1
-                    if _ie > _is and self.bam_evidence.count_spliced_reads(
-                            seqid, _is, _ie) < 1:
-                        logger.debug(
-                            f"  Terminal audit: dropping 3'-exon "
-                            f"{_tx_order[-1].start}-{_tx_order[-1].end} "
-                            f"({template.gene_id}, intron {_is}-{_ie}: 0 jct reads)")
-                        _tx_order.pop()
-                    else:
-                        break
+                    if _ie > _is:
+                        _reads = self.bam_evidence.count_spliced_reads(seqid, _is, _ie)
+                        if _low_confidence_terminal(_tx_order[-1], _tx_order[-2], _reads):
+                            logger.debug(
+                                f"  Terminal audit: dropping 3'-exon "
+                                f"{_tx_order[-1].start}-{_tx_order[-1].end} "
+                                f"({template.gene_id}, intron {_is}-{_ie}: "
+                                f"{_reads} jct reads)")
+                            _tx_order.pop()
+                            continue
+                    break
 
                 gene_exons = _tx_order
 
