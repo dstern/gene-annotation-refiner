@@ -5330,7 +5330,7 @@ class GeneAnnotationRefiner:
             # and may not confirm isoseq-derived introns even when the splice
             # sites are real (e.g. different mapping tolerances, tissue
             # specificity, or low coverage in the short-read library).
-            if self.bam_evidence.available and source_label != 'TransDecoder':
+            if self.bam_evidence.available and source_label not in ('TransDecoder', 'Manual'):
                 introns = list(best_tx.introns())
                 if introns:
                     counts = [
@@ -5427,8 +5427,8 @@ class GeneAnnotationRefiner:
                     # real even when portcullis does not confirm the junctions
                     # (e.g. because the gene is lowly expressed and portcullis
                     # filtered out low-count junctions in its reliability pass).
-                    has_td_support = 'TransDecoder' in src_set
-                    if self.bam_evidence.available and not has_td_support:
+                    has_trusted_support = bool(src_set & {'TransDecoder', 'Manual'})
+                    if self.bam_evidence.available and not has_trusted_support:
                         left_reads  = self.bam_evidence.count_spliced_reads(
                             seqid, left_intron[0],  left_intron[1])
                         right_reads = self.bam_evidence.count_spliced_reads(
