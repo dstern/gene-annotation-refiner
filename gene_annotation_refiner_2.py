@@ -5412,6 +5412,22 @@ class GeneAnnotationRefiner:
                         [left_intron, right_intron],
                         n_sources=len(src_set))
 
+                    # Hard override: if junction evidence is available and
+                    # BOTH flanking introns have zero reads, force posterior
+                    # to 0 regardless of coverage or source count.  An exon
+                    # whose neighbouring splice sites have no RNA-seq support
+                    # at all is not a real internal exon — coverage alone is
+                    # not sufficient evidence.  Sequencing errors or rare
+                    # alternative sites can produce canonical GT-AG dinucleotides
+                    # at non-functional positions; only junction reads confirm use.
+                    if self.bam_evidence.available:
+                        left_reads  = self.bam_evidence.count_spliced_reads(
+                            seqid, left_intron[0],  left_intron[1])
+                        right_reads = self.bam_evidence.count_spliced_reads(
+                            seqid, right_intron[0], right_intron[1])
+                        if left_reads == 0 and right_reads == 0:
+                            posterior = 0.0
+
                     if posterior < self.calibrator.drop_threshold:
                         # Only drop if removal creates a canonical intron
                         gap_s = sorted_ge[i - 1].end + 1
