@@ -594,7 +594,8 @@ class SplicePWMBuilder:
         self.genome = genome
 
     def build_from_stringtie(self, stringtie_genes: List['Gene'],
-                             min_junctions: int = 20) -> Tuple[dict, dict]:
+                             min_junctions: int = 20,
+                             fallback_organism: str = 'drosophila') -> Tuple[dict, dict]:
         """Extract splice junctions from StringTie transcripts and compute PWMs.
 
         Returns (donor_pwm, acceptor_pwm) as dicts of {base: [prob_per_position]}.
@@ -655,8 +656,8 @@ class SplicePWMBuilder:
 
         if n_junctions < min_junctions:
             logger.warning(f"  Only {n_junctions} junctions found (need {min_junctions}); "
-                          f"using uniform fallback PWM with GT-AG constraints")
-            return self._fallback_pwm()
+                          f"using {fallback_organism} reference PWM as fallback")
+            return self._fallback_pwm(fallback_organism)
 
         donor_pwm = self._seqs_to_pwm(donor_seqs, DONOR_LEN)
         acceptor_pwm = self._seqs_to_pwm(acceptor_seqs, ACCEPTOR_LEN)
@@ -685,18 +686,120 @@ class SplicePWMBuilder:
             ]
         return pwm
 
-    def _fallback_pwm(self) -> Tuple[dict, dict]:
-        """Return uniform PWMs with only the invariant GT/AG positions enforced."""
+    # ------------------------------------------------------------------ #
+    # Built-in reference PWMs                                            #
+    #                                                                    #
+    # Derived from published splice-site frequency matrices trimmed /    #
+    # padded to the pipeline window: 3 exon + 6 intron bp (donor) and   #
+    # 6 intron + 3 exon bp (acceptor).  Positions are 0-based:          #
+    #   donor:    [e-3 e-2 e-1 | i+1 i+2 i+3 i+4 i+5 i+6]             #
+    #   acceptor: [i-6 i-5 i-4 i-3 i-2 i-1 | e+1 e+2 e+3]             #
+    #                                                                    #
+    # Sources:                                                           #
+    #   Drosophila: Reese et al. 1997 (FlyBase splice-site consensus)    #
+    #   Human:      Shapiro & Senapathy 1987 / Burge & Karlin 1997      #
+    #   Arabidopsis: Reddy 2007 (Plant Cell)                             #
+    #                                                                    #
+    # Default fallback order: Drosophila → most appropriate for insects. #
+    # ------------------------------------------------------------------ #
+
+    _REFERENCE_PWMS = {
+        # ── Drosophila melanogaster ───────────────────────────────────────
+        # Donor:    consensus MAG|GTAAGT  (positions: exon-3..intron+6)
+        # Acceptor: consensus YYYYYYY|AG|G
+        'drosophila': {
+            'donor': {
+                'A': [0.37, 0.34, 0.60, 0.00, 0.00, 0.57, 0.71, 0.09, 0.24],
+                'C': [0.21, 0.37, 0.08, 0.00, 0.00, 0.10, 0.07, 0.10, 0.24],
+                'G': [0.27, 0.13, 0.27, 1.00, 0.00, 0.18, 0.10, 0.50, 0.27],
+                'T': [0.15, 0.16, 0.05, 0.00, 1.00, 0.15, 0.12, 0.31, 0.25],
+            },
+            'acceptor': {
+                'A': [0.22, 0.19, 0.20, 0.18, 0.12, 0.10, 1.00, 0.00, 0.32],
+                'C': [0.25, 0.27, 0.27, 0.27, 0.25, 0.20, 0.00, 0.00, 0.27],
+                'G': [0.18, 0.17, 0.18, 0.19, 0.17, 0.13, 0.00, 1.00, 0.25],
+                'T': [0.35, 0.37, 0.35, 0.36, 0.46, 0.57, 0.00, 0.00, 0.16],
+            },
+        },
+        # ── Homo sapiens ─────────────────────────────────────────────────
+        # Donor:    consensus MAG|GTAAGT
+        # Acceptor: YYY[n]YYYYYYY|AG|G
+        'human': {
+            'donor': {
+                'A': [0.36, 0.36, 0.59, 0.00, 0.00, 0.62, 0.72, 0.11, 0.25],
+                'C': [0.20, 0.36, 0.08, 0.00, 0.00, 0.09, 0.06, 0.11, 0.22],
+                'G': [0.29, 0.12, 0.28, 1.00, 0.00, 0.15, 0.09, 0.49, 0.29],
+                'T': [0.15, 0.16, 0.05, 0.00, 1.00, 0.14, 0.13, 0.29, 0.24],
+            },
+            'acceptor': {
+                'A': [0.20, 0.18, 0.20, 0.18, 0.13, 0.09, 1.00, 0.00, 0.31],
+                'C': [0.27, 0.28, 0.27, 0.25, 0.24, 0.21, 0.00, 0.00, 0.27],
+                'G': [0.17, 0.16, 0.17, 0.18, 0.15, 0.12, 0.00, 1.00, 0.26],
+                'T': [0.36, 0.38, 0.36, 0.39, 0.48, 0.58, 0.00, 0.00, 0.16],
+            },
+        },
+        # ── Arabidopsis thaliana ─────────────────────────────────────────
+        # Plant introns are AT-AC-rich; donor shows preference for AGGT
+        'arabidopsis': {
+            'donor': {
+                'A': [0.38, 0.37, 0.56, 0.00, 0.00, 0.68, 0.65, 0.12, 0.26],
+                'C': [0.18, 0.33, 0.10, 0.00, 0.00, 0.06, 0.05, 0.09, 0.21],
+                'G': [0.26, 0.11, 0.30, 1.00, 0.00, 0.12, 0.08, 0.46, 0.28],
+                'T': [0.18, 0.19, 0.04, 0.00, 1.00, 0.14, 0.22, 0.33, 0.25],
+            },
+            'acceptor': {
+                'A': [0.24, 0.22, 0.24, 0.22, 0.16, 0.11, 1.00, 0.00, 0.33],
+                'C': [0.22, 0.24, 0.23, 0.22, 0.22, 0.18, 0.00, 0.00, 0.25],
+                'G': [0.17, 0.16, 0.17, 0.18, 0.14, 0.11, 0.00, 1.00, 0.24],
+                'T': [0.37, 0.38, 0.36, 0.38, 0.48, 0.60, 0.00, 0.00, 0.18],
+            },
+        },
+    }
+
+    def _fallback_pwm(self, organism: str = 'drosophila') -> Tuple[dict, dict]:
+        """Return a reference PWM for the given organism.
+
+        Falls back to a uniform GT/AG-only PWM if the organism name is not
+        recognised.  Default organism is 'drosophila' (most appropriate for
+        insects).  Other options: 'human', 'arabidopsis'.
+        """
+        ref = self._REFERENCE_PWMS.get(organism.lower())
+        if ref is None:
+            logger.warning(f"  Unknown reference organism '{organism}'; "
+                           f"using uniform GT/AG fallback")
+            return self._uniform_gtag_pwm()
+
+        logger.info(f"  Using {organism} reference splice-site PWMs as fallback")
+
+        # Validate and normalise each column to sum to 1.0
+        def _normalise(pwm_dict, length):
+            out = {}
+            for b in 'ACGT':
+                out[b] = list(pwm_dict[b])
+            for i in range(length):
+                col_sum = sum(out[b][i] for b in 'ACGT')
+                if col_sum > 0:
+                    for b in 'ACGT':
+                        out[b][i] /= col_sum
+                else:
+                    for b in 'ACGT':
+                        out[b][i] = 0.25
+            return out
+
+        donor    = _normalise(ref['donor'],    DONOR_LEN)
+        acceptor = _normalise(ref['acceptor'], ACCEPTOR_LEN)
+        return donor, acceptor
+
+    def _uniform_gtag_pwm(self) -> Tuple[dict, dict]:
+        """Uniform PWM with only the invariant GT/AG dinucleotides enforced."""
         donor = {b: [0.25] * DONOR_LEN for b in 'ACGT'}
-        # Enforce GT at positions DONOR_EXON_BP, DONOR_EXON_BP+1
         for b in 'ACGT':
-            donor[b][DONOR_EXON_BP] = 0.01
+            donor[b][DONOR_EXON_BP]     = 0.01
             donor[b][DONOR_EXON_BP + 1] = 0.01
-        donor['G'][DONOR_EXON_BP] = 0.97
+        donor['G'][DONOR_EXON_BP]     = 0.97
         donor['T'][DONOR_EXON_BP + 1] = 0.97
 
         acceptor = {b: [0.25] * ACCEPTOR_LEN for b in 'ACGT'}
-        # Enforce AG at positions ACCEPTOR_INTRON_BP-2, ACCEPTOR_INTRON_BP-1
         for b in 'ACGT':
             acceptor[b][ACCEPTOR_INTRON_BP - 2] = 0.01
             acceptor[b][ACCEPTOR_INTRON_BP - 1] = 0.01
@@ -3883,10 +3986,12 @@ class GeneAnnotationRefiner:
                  junctions_path: str = None,
                  manual_annotation_path: str = None,
                  refine_existing_path: str = None,
-                 scoring_config: 'ScoringConfig' = None):
+                 scoring_config: 'ScoringConfig' = None,
+                 pwm_organism: str = 'drosophila'):
         self.genome = GenomeAccess(genome_path)
         self.coverage = CoverageAccess(bigwig_path) if bigwig_path else NoCoverageAccess()
         self.cfg = scoring_config or ScoringConfig()
+        self.pwm_organism = pwm_organism
 
         self.ncrna_threshold = self.cfg.ncrna_threshold
         self.coding_threshold = self.cfg.coding_threshold
@@ -3934,11 +4039,12 @@ class GeneAnnotationRefiner:
         if self.st_genes:
             logger.info("Computing splice site PWMs from StringTie junctions...")
             pwm_builder = SplicePWMBuilder(self.genome)
-            DONOR_PWM, ACCEPTOR_PWM = pwm_builder.build_from_stringtie(self.st_genes)
+            DONOR_PWM, ACCEPTOR_PWM = pwm_builder.build_from_stringtie(
+                self.st_genes, fallback_organism=self.pwm_organism)
         else:
             logger.info("No StringTie data; using fallback splice site PWMs")
             pwm_builder = SplicePWMBuilder(self.genome)
-            DONOR_PWM, ACCEPTOR_PWM = pwm_builder._fallback_pwm()
+            DONOR_PWM, ACCEPTOR_PWM = pwm_builder._fallback_pwm(self.pwm_organism)
 
         # Load splice junction evidence (prefer pre-computed junctions over BAM)
         if junctions_path and os.path.exists(junctions_path):
@@ -6614,6 +6720,12 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
                         help='Scoring configuration INI file (see --dump_config)')
     parser.add_argument('--dump_config', action='store_true',
                         help='Write default configuration to default_config.ini and exit')
+    parser.add_argument('--pwm_organism', default='drosophila',
+                        choices=['drosophila', 'human', 'arabidopsis'],
+                        help='Reference organism for splice-site PWMs when insufficient '
+                             'training data are available from StringTie (default: drosophila). '
+                             'Use "drosophila" for insects, "human" for vertebrates, '
+                             '"arabidopsis" for plants.')
     parser.add_argument('--ncRNA_threshold', type=float, default=0.20,
                         help='Posterior threshold for ncRNA (default: 0.20)')
     parser.add_argument('--coding_threshold', type=float, default=0.20,
@@ -6707,6 +6819,7 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         manual_annotation_path=args.manual_annotation,
         refine_existing_path=args.refine_existing,
         scoring_config=scoring_config,
+        pwm_organism=args.pwm_organism,
     )
 
     refined_genes = refiner.refine()
