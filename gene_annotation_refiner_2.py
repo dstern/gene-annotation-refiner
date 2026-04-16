@@ -1929,12 +1929,18 @@ MIN_EXON_SIZE = 3
 
 def enforce_canonical_splice_sites(genome: 'GenomeAccess', seqid: str,
                                     exons: List[Feature], strand: str,
-                                    max_adjust: int = 5) -> List[Feature]:
+                                    max_adjust: int = 5,
+                                    bam_evidence=None) -> List[Feature]:
     """Adjust exon boundaries by up to max_adjust bp to find canonical GT-AG splice sites.
 
     For each internal exon boundary (i.e., not the first 5' or last 3' end),
     check whether shifting the boundary by ±1-max_adjust bp yields a canonical
     GT-AG (or GC-AG) dinucleotide pair. Prefer the smallest adjustment.
+
+    If bam_evidence is provided and the original boundary already has junction
+    read support, it is not adjusted — junction data trump splice-site sequence
+    preference.  This prevents a nearby GT dinucleotide (never actually used)
+    from overriding a real GC-AG site with thousands of supporting reads.
     """
     if len(exons) < 2:
         return exons
@@ -1945,6 +1951,32 @@ def enforce_canonical_splice_sites(genome: 'GenomeAccess', seqid: str,
     for i in range(len(sorted_exons) - 1):
         exon_a = adjusted[-1]  # already-adjusted upstream exon
         exon_b = sorted_exons[i + 1]
+
+        orig_intron_s = exon_a.end + 1
+        orig_intron_e = exon_b.start - 1
+
+        # If the original intron boundary already has junction read support,
+        # do not adjust it.  A supported GC-AG (or any other) site is real;
+        # a nearby GT-AG without reads is not.
+        if (bam_evidence is not None and
+                getattr(bam_evidence, 'available', False) and
+                orig_intron_e > orig_intron_s):
+            # Use donor/acceptor queries (not count_spliced_reads) because
+            # portcullis stores intron_start as exon_end (0-based), whereas
+            # the pipeline stores it as exon_end+1; the offset causes
+            # count_spliced_reads(tolerance=0) to miss real junctions.
+            if strand == '+':
+                orig_reads = bam_evidence.reads_at_donor(seqid, exon_a.end, tolerance=0)
+            else:
+                orig_reads = bam_evidence.reads_at_acceptor(seqid, exon_b.start, tolerance=0)
+            if orig_reads > 0:
+                adjusted.append(Feature(
+                    seqid=exon_b.seqid, source=exon_b.source, ftype=exon_b.ftype,
+                    start=exon_b.start, end=exon_b.end, score=exon_b.score,
+                    strand=exon_b.strand, phase=exon_b.phase,
+                    attributes=exon_b.attributes
+                ))
+                continue
 
         # The intron is between exon_a.end+1 and exon_b.start-1
         best_a_end = exon_a.end
@@ -4309,7 +4341,8 @@ class GeneAnnotationRefiner:
                         tx, self.coverage, self.genome, gene.seqid, gene.strand)
                 # Enforce canonical splice sites (adjust ±5bp)
                 tx.exons = enforce_canonical_splice_sites(
-                    self.genome, gene.seqid, tx.exons, gene.strand)
+                    self.genome, gene.seqid, tx.exons, gene.strand,
+                    bam_evidence=self.bam_evidence)
                 # Remove exons that still create non-canonical splice sites
                 tx.exons = self._remove_noncanonical_exons(
                     gene.seqid, tx.exons, gene.strand)
@@ -4371,7 +4404,8 @@ class GeneAnnotationRefiner:
                         tx, self.coverage, self.genome, gene.seqid, gene.strand)
                 tx.exons = filter_impossible_introns(tx.exons)
                 tx.exons = enforce_canonical_splice_sites(
-                    self.genome, gene.seqid, tx.exons, gene.strand)
+                    self.genome, gene.seqid, tx.exons, gene.strand,
+                    bam_evidence=self.bam_evidence)
                 tx.exons = self._remove_noncanonical_exons(
                     gene.seqid, tx.exons, gene.strand)
             gene.transcripts = deduplicate_isoforms(gene.transcripts)
@@ -4405,7 +4439,8 @@ class GeneAnnotationRefiner:
                     gene.seqid, tx.exons, gene.strand)
             for tx in gene.transcripts:
                 tx.exons = enforce_canonical_splice_sites(
-                    self.genome, gene.seqid, tx.exons, gene.strand)
+                    self.genome, gene.seqid, tx.exons, gene.strand,
+                    bam_evidence=self.bam_evidence)
             gene.transcripts = deduplicate_isoforms(gene.transcripts)
             gene.transcripts = [
                 tx for tx in gene.transcripts
