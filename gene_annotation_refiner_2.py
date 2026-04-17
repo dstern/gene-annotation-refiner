@@ -6496,17 +6496,27 @@ class GeneAnnotationRefiner:
             # Stop at the first exon that passes both checks.
             TERMINAL_MIN_READS = 5      # below this, also check coverage ratio
             TERMINAL_COV_RATIO = 0.10   # terminal exon must be > 10% of anchor cov
+            TERMINAL_EXTREME_COV_RATIO = 0.01  # even with junctions, drop if < 1%
 
             def _low_confidence_terminal(terminal_exon, anchor_exon, intron_reads):
                 """Return True if the terminal exon looks like a rare minor isoform."""
                 if intron_reads < 1:
                     return True
+                t_cov = self.coverage.get_mean_coverage(
+                    seqid, terminal_exon.start, terminal_exon.end)
+                a_cov = self.coverage.get_mean_coverage(
+                    seqid, anchor_exon.start, anchor_exon.end)
                 if intron_reads < TERMINAL_MIN_READS:
-                    t_cov = self.coverage.get_mean_coverage(
-                        seqid, terminal_exon.start, terminal_exon.end)
-                    a_cov = self.coverage.get_mean_coverage(
-                        seqid, anchor_exon.start, anchor_exon.end)
                     if a_cov > 1.0 and t_cov < a_cov * TERMINAL_COV_RATIO:
+                        return True
+                # Even with many junction reads, drop terminal exons with
+                # extreme coverage disparity relative to the anchor — these
+                # are typically from a different gene or a rare minor isoform
+                # that happens to share a splice site.
+                if a_cov > 1.0 and t_cov < a_cov * TERMINAL_EXTREME_COV_RATIO:
+                    n_src = len(set(
+                        terminal_exon.attributes.get('sources', '').split(',')))
+                    if n_src <= 1:
                         return True
                 return False
 
