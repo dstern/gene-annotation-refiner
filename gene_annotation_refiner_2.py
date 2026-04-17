@@ -5534,135 +5534,27 @@ class GeneAnnotationRefiner:
                 # ── Steps (b–e): follow junction chain downstream ───────────
                 new_exons = []
                 for _ in range(MAX_ITERATIONS):
-                    if strand == '-':
-                        # On − strand "downstream" = lower genomic coords.
-                        # current_donor = terminal/last exon's start position.
-                        # The intron starts at current_donor (going leftward);
-                        # reads_at_donor(seqid, exon.end, ...) expects exon.end,
-                        # but here we need reads where intron_start = current_donor.
-                        # reads_at_donor queries intron_start = donor_pos + 1, so
-                        # donor_pos = current_donor - 1.
-                        next_reads = self.bam_evidence.reads_at_donor(
-                            seqid, current_donor - 1, tolerance=2)
-                        if next_reads < MIN_DOWNSTREAM_READS:
-                            break
-                        # Find the specific best junction departing from here
-                        best_junc = None
-                        for j_start, j_end, j_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid,
-                                    max(1, current_donor - 500_000),
-                                    current_donor,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if abs(j_end - (current_donor - 1)) <= 3:
-                                if best_junc is None or j_count > best_junc[2]:
-                                    best_junc = (j_start, j_end, j_count)
-                        if best_junc is None:
-                            break
-                        j_start, _, j_count = best_junc
-                        exon_end = j_start - 1   # exon ends just before intron start
-                        # Find the start of this new exon: next departing junction
-                        next_junc = None
-                        for j2_start, j2_end, j2_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid,
-                                    max(1, exon_end - 50_000),
-                                    exon_end,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if j2_end < exon_end:
-                                if next_junc is None or j2_count > next_junc[2]:
-                                    next_junc = (j2_start, j2_end, j2_count)
-                        exon_start = (next_junc[1] + 1
-                                      if next_junc else max(1, exon_end - 200))
-                        current_donor = exon_start
-
-                    else:  # strand == '+'
-                        next_reads = self.bam_evidence.reads_at_donor(
-                            seqid, current_donor, tolerance=2)
-                        if next_reads < MIN_DOWNSTREAM_READS:
-                            break
-                        best_junc = None
-                        for j_start, j_end, j_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid,
-                                    current_donor,
-                                    current_donor + 500_000,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if abs(j_start - (current_donor + 1)) <= 3:
-                                if best_junc is None or j_count > best_junc[2]:
-                                    best_junc = (j_start, j_end, j_count)
-                        if best_junc is None:
-                            break
-                        _, j_end, j_count = best_junc
-                        exon_start = j_end + 1
-                        next_junc = None
-                        for j2_start, j2_end, j2_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid,
-                                    exon_start,
-                                    exon_start + 50_000,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if j2_start > exon_start:
-                                if next_junc is None or j2_count > next_junc[2]:
-                                    next_junc = (j2_start, j2_end, j2_count)
-                        exon_end = (next_junc[0] - 1
-                                    if next_junc else exon_start + 200)
-                        current_donor = exon_end
-
-                    # Coverage gate against the reference exon floor
-                    exon_cov = self.coverage.get_mean_coverage(
-                        seqid, exon_start, exon_end)
-                    if exon_cov < cov_floor * 0.15:
-                        logger.debug(
-                            f"  Downstream exon {exon_start}-{exon_end} failed "
-                            f"coverage gate ({exon_cov:.1f} < "
-                            f"{cov_floor * 0.15:.1f}, floor={cov_floor:.1f})")
-                        break
-
-                    new_exon = Feature(
-                        seqid=seqid, source='Refined', ftype='exon',
-                        start=exon_start, end=exon_end,
-                        score=0.5, strand=strand,
-                        phase='.', attributes={'sources': 'junction_recovery'})
-                    new_exons.append(new_exon)
-                    logger.info(
-                        f"  Recovered downstream exon {exon_start}-{exon_end} "
-                        f"for {gene.gene_id} ({j_count} reads, cov={exon_cov:.1f})")
-
-                    # Stop when a valid ORF with stop codon is found
-                    test_exons = sorted_exons + new_exons
-                    test_orf = orf_finder.find_best_orf(
-                        seqid, test_exons, strand, coverage=self.coverage)
-                    if test_orf is not None:
-                        new_cds_list = orf_finder.orf_to_genomic_cds(
-                            seqid, test_exons, strand, test_orf[0], test_orf[1])
-                        if new_cds_list and has_stop_codon(
-                                self.genome, seqid, new_cds_list, strand):
-                            logger.info(
-                                f"  Stop codon found after {len(new_exons)} "
-                                f"recovered exon(s) for {gene.gene_id}")
-                            break
-
-                # --- Step (b–c): follow junction chain downstream ---
-                new_exons = []
-                for _ in range(MAX_ITERATIONS):
                     if strand == '+':
-                        # Find junctions departing from current_donor
+                        # Find junctions departing from current_donor.
+                        # On + strand: intron_start = current_donor + 1, so
+                        # reads_at_donor(current_donor) checks for junctions where
+                        # j_start = current_donor + 1.
                         next_reads = self.bam_evidence.reads_at_donor(
                             seqid, current_donor, tolerance=2)
                         if next_reads < MIN_DOWNSTREAM_READS:
                             break
-                        # Find the specific junction
-                        best_junc = None
-                        for j_start, j_end, j_count in \
-                                self.bam_evidence.find_novel_junctions(
-                                    seqid, current_donor, current_donor + 500_000,
-                                    min_reads=MIN_DOWNSTREAM_READS):
-                            if abs(j_start - (current_donor + 1)) <= 3:
-                                if best_junc is None or j_count > best_junc[2]:
-                                    best_junc = (j_start, j_end, j_count)
-                        if best_junc is None:
+                        # Find the specific junction departing at current_donor+1
+                        # (within ±3 bp tolerance).  Use find_junctions_starting_in
+                        # capped to max_window to avoid cross-gene contamination.
+                        fwd_juncs = self.bam_evidence.find_junctions_starting_in(
+                            seqid,
+                            current_donor + 1 - 3,
+                            current_donor + 1 + 3,
+                            min_reads=MIN_DOWNSTREAM_READS)
+                        if not fwd_juncs:
                             break
+                        # Take the junction with the most reads (normally just one)
+                        best_junc = max(fwd_juncs, key=lambda x: x[2])
                         _, j_end, j_count = best_junc
                         exon_start = j_end + 1
                         # Find the end of this new exon: the most adjacent departing
