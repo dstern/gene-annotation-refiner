@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(awk '$1==\"scaffold_2\" && $4>=78990000 && $5<=79050000 && $3==\"gene\"' \"/Users/ds2996/Library/CloudStorage/Dropbox-HHMI/David Stern/code/Claude_code/gene_annotation_refiner_v2/test_005137/out.gff\")",
+      "Bash(awk '$3==\"exon\"')",
+      "Bash(awk '$3==\"exon\"' test_005137/out.gff)",
+      "Bash(awk '$3==\"gene\" && /000016/' test_005137/out.gff)",
+      "Bash(grep \"ID=g3005683$\\\\|ID=g3005711$\" \"/Users/ds2996/Library/CloudStorage/Dropbox-HHMI/David Stern/code/Claude_code/gene_annotation_refiner_v2/test_005137/subset_transdecoder.gff3\")",
+      "Bash(awk '$1==\"scaffold_2\" && $4>=79028000 && $5<=79045000 && $3==\"gene\"' \"/Users/ds2996/Library/CloudStorage/Dropbox-HHMI/David Stern/code/Claude_code/gene_annotation_refiner_v2/test_run/Apis_helixer_3v25.sorted.gff\")",
+      "Bash(awk '$1==\"scaffold_2\" && $4>=79028000 && $5<=79045000 && $3==\"gene\"' \"/Users/ds2996/Library/CloudStorage/Dropbox-HHMI/David Stern/code/Claude_code/gene_annotation_refiner_v2/test_run/Acyrthosiphon_pisum.27xi23_isoseq.transdecoder_isoseqUpdated.updated.12xii23.gff3\")",
+      "Bash(awk '$9 ~ /Apis_helixer_scaffold_2_005137/ && $3==\"exon\"' test_run/Apis_helixer_3v25.sorted.gff)",
+      "Bash(awk '$9 ~ /Apis_helixer_scaffold_2_005137/ && \\($3==\"gene\" || $3==\"mRNA\"\\)' test_run/Apis_helixer_3v25.sorted.gff)",
+      "Bash(awk '$9 ~ /g3005711/ && $3==\"CDS\"' subset_transdecoder.gff3)",
+      "Bash(awk '$9 ~ /g3005711/' subset_transdecoder.gff3)",
+      "Bash(awk '{print $3}')",
+      "Bash(awk '$3==\"gene\" || $3==\"mRNA\"' out.gff)",
+      "Bash(awk '$9 ~ /test_005137_000016/' out.gff)",
+      "Bash(awk '$1==\"scaffold_2\" && $3==\"gene\" && $4<79035000 && $5>78990000' test_run/Apis_refined_17iv26.gff)",
+      "Bash(awk '$1==\"scaffold_2\" && $3==\"gene\" && $4<78870000 && $5>78800000' test_run/Apis_refined_18iv26.gff)",
+      "Bash(awk '$1==\"scaffold_2\" && $3==\"gene\" && $4>=78810000 && $5<=78860000' test_run/Apis_helixer_3v25.sorted.gff)",
+      "Bash(awk '$1==\"scaffold_2\" && $3==\"gene\" && $4>=78810000 && $5<=78860000' test_run/Acyrthosiphon_pisum.27xi23_isoseq.transdecoder_isoseqUpdated.updated.12xii23.gff3)",
+      "Bash(awk '$1==\"scaffold_2\" && $3==\"transcript\" && $4>=78810000 && $5<=78860000' test_run/Apis.mixed.f0.75.gtf)",
+      "Bash(bash make_subset.sh)",
+      "Bash(python3 ../gene_annotation_refiner_2.py --genome ../test_run/Acyrthosiphon_pisum_JIC1_v1.0.scaffolds_mtDNA.fa --output out.gff --helixer subset_helixer.gff --stringtie subset_stringtie.gtf --transdecoder subset_transdecoder.gff3 --bigwig ../test_run/Apis.bam.bw --junctions subset_junctions.tab --renumber --gene_prefix test_001559 --trace_gene Apis_helixer_scaffold_2_001559,Apis_helixer_scaffold_2_001560,g3005702)",
+      "Bash(tee run.log)",
+      "Bash(awk '$1==\"scaffold_2\" && $3==\"gene\" && $4<78870000 && $5>78800000' out.gff)",
+      "Bash(awk '$3==\"gene\" && $9 ~ /001559|001560|001561/' subset_helixer.gff)",
+      "Bash(awk '$9 ~ /001560/ && $3==\"exon\"' subset_helixer.gff)",
+      "Bash(awk '{printf \"  %s-%s \\(len=%d\\)\\\\n\", $4, $5, $5-$4+1}')",
+      "Bash(awk '$9 ~ /g3005702/ && $3==\"exon\"' subset_transdecoder.gff3)",
+      "Bash(sort -k4 -n)",
+      "Bash(awk '$9 ~ /test_001559_000011/' out.gff)"
+    ],
+    "additionalDirectories": [
+      "/Users/ds2996/Library/CloudStorage/Dropbox-HHMI/David Stern/code/Claude_code/gene_annotation_refiner_v2"
+    ]
+  }
+}

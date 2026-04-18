@@ -2551,6 +2551,66 @@ def score_acceptor(seq: str) -> float:
     return score_splice_site(seq, ACCEPTOR_PWM)
 
 
+def _intron_is_canonical(seqid: str, strand: str,
+                          intron_s: int, intron_e: int, genome) -> bool:
+    """Return True if the intron [intron_s, intron_e] has a canonical GT-AG or
+    GC-AG splice pair.  Mirrors the check inside _remove_noncanonical_exons
+    but is exposed at module scope so isoform scoring can use it.
+
+    Returns True when the genome is unavailable or the scaffold is truncated,
+    to avoid penalising for missing data.
+    """
+    if genome is None or intron_e - intron_s + 1 < 4:
+        return True
+    if strand == '+':
+        donor = genome.get_sequence(seqid, intron_s, intron_s + 1).upper()
+        acceptor = genome.get_sequence(seqid, intron_e - 1, intron_e).upper()
+    else:
+        donor = reverse_complement(
+            genome.get_sequence(seqid, intron_e - 1, intron_e)).upper()
+        acceptor = reverse_complement(
+            genome.get_sequence(seqid, intron_s, intron_s + 1)).upper()
+    if len(donor) < 2 or len(acceptor) < 2:
+        return True
+    return ((donor == 'GT' and acceptor == 'AG') or
+            (donor == 'GC' and acceptor == 'AG'))
+
+
+def _boundary_yields_canonical_splice(seqid: str, strand: str, which: str,
+                                        pos: int, genome) -> bool:
+    """Return True if this exon boundary yields a canonical splice dinucleotide
+    for the adjacent intron.
+
+    which='end'   → intron is to the right (genomic); the 2bp at pos+1..pos+2
+                    is the intron's 5' end (+strand donor / -strand acceptor).
+    which='start' → intron is to the left (genomic); the 2bp at pos-2..pos-1
+                    is the intron's 3' end (+strand acceptor / -strand donor).
+
+    The check is local (doesn't know the other end of the intron), so it's a
+    necessary but not sufficient condition — still enough to rule out
+    boundaries that can't produce a canonical splice (donor CA, acceptor TT,
+    etc.).  Terminal-exon boundaries aren't splice sites at all; this check
+    will treat them with a random-sequence bias but the filter only fires when
+    candidates disagree, so the rare spurious activation is harmless.
+    """
+    if genome is None:
+        return True
+    if which == 'end':
+        seq = genome.get_sequence(seqid, pos + 1, pos + 2).upper()
+        if len(seq) < 2:
+            return True
+        if strand == '+':
+            return seq in ('GT', 'GC')
+        return reverse_complement(seq) == 'AG'
+    # 'start'
+    seq = genome.get_sequence(seqid, pos - 2, pos - 1).upper()
+    if len(seq) < 2:
+        return True
+    if strand == '+':
+        return seq == 'AG'
+    return reverse_complement(seq) in ('GT', 'GC')
+
+
 def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
                               candidates: set, coverage, genome,
                               bam_evidence=None) -> int:
@@ -2616,6 +2676,23 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
         active_candidates = {p for p, r in junction_reads.items() if r > 0}
     else:
         active_candidates = set(candidates)
+
+    # ── Step 1b: canonical-dinucleotide filter ─────────────────────────────
+    # If the active candidates split between those that yield a canonical
+    # splice dinucleotide at this boundary and those that don't, drop the
+    # non-canonical ones.  This catches cases where two near-duplicate
+    # boundaries differ by a few bp and only one lands on a GT/GC/AG site
+    # — e.g. 020810's Helixer last exon end (77934859 → GT donor) vs
+    # TransDecoder's boundary (77934852 → CA donor).  Without this filter
+    # the non-canonical position can win on coverage alone, silently
+    # producing a splice site that _remove_noncanonical_exons then deletes
+    # the whole exon to repair.
+    if len(active_candidates) > 1 and genome is not None:
+        canonical = {p for p in active_candidates
+                     if _boundary_yields_canonical_splice(
+                         seqid, strand, which, p, genome)}
+        if canonical and len(canonical) < len(active_candidates):
+            active_candidates = canonical
 
     # Start from the most conservative (smallest) position as baseline.
     if which == 'start':
@@ -3143,6 +3220,37 @@ class GeneMerger:
                     f"{gene_a.gene_id} x {gene_b.gene_id}: REJECT "
                     f"(gap_size={gap_size} outside [1, 50000])")
             return False
+
+        # Veto the merge if the gap would become a non-canonical intron.
+        # The merge treats the gap between the two genes' terminal exons as
+        # a new intron.  If its donor/acceptor are not GT/GC...AG, this is a
+        # fabricated intron that _remove_noncanonical_exons will later try
+        # to "repair" by cascade-deleting internal exons, wiping the gene.
+        # Why: see gene g3005702 + Helixer_001561 merge — gap AA...GA
+        # caused 10 of 14 exons to be removed and the transcript dropped.
+        # How to apply: any gap larger than MIN_INTRON_SIZE must have
+        # canonical splice dinucleotides on the transcribed strand.
+        if gap_size >= MIN_INTRON_SIZE:
+            if upstream.strand == '+':
+                donor_di = self.genome.get_sequence(
+                    upstream.seqid, gap_start, gap_start + 1).upper()
+                acceptor_di = self.genome.get_sequence(
+                    upstream.seqid, gap_end - 1, gap_end).upper()
+            else:
+                donor_di = reverse_complement(self.genome.get_sequence(
+                    upstream.seqid, gap_end - 1, gap_end)).upper()
+                acceptor_di = reverse_complement(self.genome.get_sequence(
+                    upstream.seqid, gap_start, gap_start + 1)).upper()
+            if (len(donor_di) >= 2 and len(acceptor_di) >= 2 and
+                    (donor_di not in ('GT', 'GC') or acceptor_di != 'AG')):
+                if self.tracer.enabled and self.tracer.pair_matches(
+                        upstream, downstream):
+                    self.tracer.event(
+                        "should_merge",
+                        f"{upstream.gene_id} x {downstream.gene_id}: REJECT "
+                        f"(merge-gap intron non-canonical "
+                        f"donor={donor_di} acceptor={acceptor_di})")
+                return False
 
         evidence_count = 0
         evidence_required = 2
@@ -5865,19 +5973,37 @@ class GeneAnnotationRefiner:
                 # of exon) on the plus strand.
                 best_hidden = None
                 if hidden_juncs:
-                    # Junction read count is the primary evidence — portcullis
-                    # pre-filters to reliable junctions, so MIN_DOWNSTREAM_READS
-                    # is sufficient.  PWM is computed as a secondary ranking key
-                    # only, NOT as a hard filter: non-canonical exon/intron context
-                    # can score very negatively in the PWM even when the junction
-                    # is real (confirmed by read depth).
+                    # Hard canonical filter: only follow hidden introns whose
+                    # donor AND acceptor dinucleotides are canonical (GT/GC-AG).
+                    # Portcullis retains some non-canonical junctions (e.g. read
+                    # depth overrides the canonical filter) that produce
+                    # spurious intron splits in the terminal exon — see 020810's
+                    # AA-AG intron at 77934853-77935162 with 10 reads.
                     scored = []
                     for js, je, jc in hidden_juncs:
                         if strand == '-':
-                            # Donor on minus strand: intron is to the LEFT of
-                            # the terminal exon.  Donor dinucleotide is at the
-                            # RIGHT side of the intron (je = last intron base,
-                            # je+1 = first exon base = exon.start).
+                            # For - strand: intron is to the LEFT. Donor (5'->3'
+                            # transcript direction) is at the HIGH genomic end of
+                            # the intron (je = last intron base, exon starts at
+                            # je+1).  Acceptor is at the LOW end (js = first
+                            # intron base, upstream exon ends at js-1).
+                            donor_di = reverse_complement(
+                                self.genome.get_sequence(seqid, je - 1, je)).upper()
+                            acceptor_di = reverse_complement(
+                                self.genome.get_sequence(seqid, js, js + 1)).upper()
+                        else:
+                            # For + strand: intron runs left→right.  Donor at
+                            # (js, js+1) and acceptor at (je-1, je).
+                            donor_di = self.genome.get_sequence(
+                                seqid, js, js + 1).upper()
+                            acceptor_di = self.genome.get_sequence(
+                                seqid, je - 1, je).upper()
+                        if len(donor_di) < 2 or len(acceptor_di) < 2:
+                            continue  # scaffold truncation — skip
+                        if donor_di not in ('GT', 'GC') or acceptor_di != 'AG':
+                            continue  # non-canonical — skip
+
+                        if strand == '-':
                             donor_exon_end = je + 1
                             ss_seq = self.genome.get_sequence(
                                 seqid,
@@ -5885,7 +6011,6 @@ class GeneAnnotationRefiner:
                                 donor_exon_end + DONOR_EXON_BP - 1)
                             pwm = score_donor(reverse_complement(ss_seq))
                         else:
-                            # Donor on plus strand: exon ends at js-1.
                             ss_seq = self.genome.get_sequence(
                                 seqid,
                                 js - DONOR_EXON_BP,
@@ -5894,7 +6019,8 @@ class GeneAnnotationRefiner:
                         scored.append((js, je, jc, pwm))
                     # Primary sort by reads, secondary by PWM
                     scored.sort(key=lambda x: (-x[2], -x[3]))
-                    best_hidden = scored[0]
+                    if scored:
+                        best_hidden = scored[0]
 
                 # If no junction-based hidden intron but secondary trigger
                 # (no stop codon), proceed without trimming.
@@ -6417,16 +6543,26 @@ class GeneAnnotationRefiner:
 
             # Select the best-supported isoform rather than the longest.
             # Score each isoform by:
-            #   (1) number of junction-confirmed introns  — primary key
-            #   (2) mean exon coverage                   — tiebreaker
-            # This ensures a well-supported shorter isoform beats a longer one
-            # with poorly-supported introns (e.g. g3005666.21 > g3005666.11).
+            #   (1) fewest non-canonical introns          — primary key
+            #   (2) number of junction-confirmed introns  — secondary key
+            #   (3) mean exon coverage                    — tiebreaker
+            # Non-canonical introns come first because a TransDecoder isoform
+            # can pick up an extra junction-confirmed intron that traces back
+            # to a misassembled transcript (e.g. 020810's g3005661.31 has a
+            # CA-AG intron that would otherwise win on junction count alone).
+            # Ranking canonical isoforms first rejects those chimeras before
+            # they enter Phase 4.
             def _score_isoform(tx):
                 n_junc = 0
+                n_noncanon = 0
                 for intron_s, intron_e in tx.introns():
                     if self.bam_evidence.count_spliced_reads(
                             template.seqid, intron_s, intron_e) > 0:
                         n_junc += 1
+                    if not _intron_is_canonical(
+                            template.seqid, template.strand,
+                            intron_s, intron_e, self.genome):
+                        n_noncanon += 1
                 if tx.exons:
                     mean_cov = sum(
                         self.coverage.get_mean_coverage(
@@ -6435,7 +6571,7 @@ class GeneAnnotationRefiner:
                     ) / len(tx.exons)
                 else:
                     mean_cov = 0.0
-                return (n_junc, mean_cov)
+                return (-n_noncanon, n_junc, mean_cov)
 
             best_tx = max(template.transcripts, key=_score_isoform)
             if not best_tx.exons:
