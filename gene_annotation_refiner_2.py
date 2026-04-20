@@ -5051,6 +5051,14 @@ class GeneAnnotationRefiner:
         consensus_genes = self._split_by_cds_overlap(consensus_genes)
         self.tracer.snapshot("After Step 5h (CDS-overlap split)", consensus_genes)
 
+        # Step 5h.5: Split merged genes flagged by excessive UTR-exon counts.
+        # After CDS reassignment, a transcript with 3+ UTR exons on one end
+        # is almost always two neighboring genes merged via a bridging
+        # template.  Use StringTie evidence to find the real split point.
+        logger.info("\nStep 5h.5: Splitting merged genes via excessive-UTR heuristic...")
+        consensus_genes = self._split_excessive_utr_genes(consensus_genes)
+        self.tracer.snapshot("After Step 5h.5 (UTR-triggered split)", consensus_genes)
+
         # Step 5i: Repair transcripts that lost exons during filtering
         logger.info("\nStep 5i: Repairing gene models and recomputing boundaries...")
         n_repaired = 0
@@ -7158,6 +7166,134 @@ class GeneAnnotationRefiner:
         self.tracer.snapshot("After Phase 4 (selected)", selected)
 
         # ================================================================
+        # Phase 4.5: Extend terminal exons to recover UTRs
+        # ================================================================
+        # Phase 3 picks the winning template's exon boundaries verbatim.  If
+        # a StringTie template beats a Helixer/TD alternative by a small
+        # posterior margin but lacks UTR extent, the refined gene inherits
+        # the narrower StringTie boundaries and loses the UTR that Helixer
+        # or TransDecoder would have supplied.
+        # Recover UTR by extending each terminal exon's outward boundary to
+        # the widest Helixer/TD pool boundary that (a) shares the inward
+        # splice site within tolerance and (b) has RNA-seq coverage across
+        # the extension consistent with transcription.
+        logger.info("  Phase 4.5: Extending terminal exons using UTR pool...")
+        TERMINAL_INWARD_TOL = 10
+        UTR_COV_ABS_MIN = 1.0
+        UTR_COV_REL_MIN = 0.20
+        UTR_TRUSTED_SOURCES = frozenset({'Helixer', 'TransDecoder'})
+
+        selected_footprints = defaultdict(list)
+        for other in selected:
+            selected_footprints[(other.seqid, other.strand)].append(
+                (other.gene_id, other.start, other.end))
+
+        n_extended = 0
+        for gene in selected:
+            pool = scored_exons_by_region.get((gene.seqid, gene.strand), [])
+            if not pool:
+                continue
+            others = [(gid, s, e) for (gid, s, e)
+                      in selected_footprints[(gene.seqid, gene.strand)]
+                      if gid != gene.gene_id]
+
+            for tx in gene.transcripts:
+                if not tx.exons:
+                    continue
+                sorted_exons = sorted(tx.exons, key=lambda e: e.start)
+                multi_exon = len(sorted_exons) > 1
+
+                # --- Extend the low-coordinate terminal exon outward (lower) ---
+                first_exon = sorted_exons[0]
+                original_start = first_exon.start
+                best_start = original_start
+                exon_cov_first = self.coverage.get_mean_coverage(
+                    gene.seqid, first_exon.start, first_exon.end)
+
+                for pstart, pend, _sc, psrc, _pcov in pool:
+                    if not (psrc & UTR_TRUSTED_SOURCES):
+                        continue
+                    if pstart >= best_start:
+                        continue
+                    if multi_exon:
+                        if abs(pend - first_exon.end) > TERMINAL_INWARD_TOL:
+                            continue
+                    else:
+                        ovl = min(first_exon.end, pend) - max(first_exon.start, pstart)
+                        if ovl < 0.5 * (first_exon.end - first_exon.start + 1):
+                            continue
+                    ext_start, ext_end = pstart, original_start - 1
+                    if ext_end < ext_start:
+                        continue
+                    ext_cov = self.coverage.get_mean_coverage(
+                        gene.seqid, ext_start, ext_end)
+                    if ext_cov < UTR_COV_ABS_MIN:
+                        continue
+                    if exon_cov_first > 0 and ext_cov < UTR_COV_REL_MIN * exon_cov_first:
+                        continue
+                    if any(os_ <= ext_end and oe_ >= ext_start
+                           for (_g, os_, oe_) in others):
+                        continue
+                    best_start = pstart
+
+                if best_start < original_start:
+                    if self.tracer.enabled and self.tracer.matches(gene):
+                        logger.info(
+                            f"[TRACE] Phase 4.5 extend low-end | {gene.gene_id} | "
+                            f"{original_start} -> {best_start} "
+                            f"(+{original_start - best_start} bp)")
+                    first_exon.start = best_start
+                    n_extended += 1
+
+                # --- Extend the high-coordinate terminal exon outward (higher) ---
+                last_exon = sorted_exons[-1]
+                original_end = last_exon.end
+                best_end = original_end
+                exon_cov_last = self.coverage.get_mean_coverage(
+                    gene.seqid, last_exon.start, last_exon.end)
+
+                for pstart, pend, _sc, psrc, _pcov in pool:
+                    if not (psrc & UTR_TRUSTED_SOURCES):
+                        continue
+                    if pend <= best_end:
+                        continue
+                    if multi_exon:
+                        if abs(pstart - last_exon.start) > TERMINAL_INWARD_TOL:
+                            continue
+                    else:
+                        ovl = min(last_exon.end, pend) - max(last_exon.start, pstart)
+                        if ovl < 0.5 * (last_exon.end - last_exon.start + 1):
+                            continue
+                    ext_start, ext_end = original_end + 1, pend
+                    if ext_end < ext_start:
+                        continue
+                    ext_cov = self.coverage.get_mean_coverage(
+                        gene.seqid, ext_start, ext_end)
+                    if ext_cov < UTR_COV_ABS_MIN:
+                        continue
+                    if exon_cov_last > 0 and ext_cov < UTR_COV_REL_MIN * exon_cov_last:
+                        continue
+                    if any(os_ <= ext_end and oe_ >= ext_start
+                           for (_g, os_, oe_) in others):
+                        continue
+                    best_end = pend
+
+                if best_end > original_end:
+                    if self.tracer.enabled and self.tracer.matches(gene):
+                        logger.info(
+                            f"[TRACE] Phase 4.5 extend high-end | {gene.gene_id} | "
+                            f"{original_end} -> {best_end} "
+                            f"(+{best_end - original_end} bp)")
+                    last_exon.end = best_end
+                    n_extended += 1
+
+            self._recompute_gene_boundaries(gene)
+
+        if n_extended:
+            logger.info(f"  Phase 4.5: Extended {n_extended} terminal exon boundary(ies)")
+        self.tracer.snapshot("After Phase 4.5 (UTR extension)", selected)
+
+        # ================================================================
         # Phase 5: Trim zero-coverage terminal exons
         # ================================================================
         for gene in selected:
@@ -7465,6 +7601,229 @@ class GeneAnnotationRefiner:
                            f"({new_gene.start}-{new_gene.end})")
 
         return split_results if split_results else [gene]
+
+    def _split_excessive_utr_genes(self, genes: List[Gene]) -> List[Gene]:
+        """Split genes flagged by an excessive UTR-exon count using StringTie evidence.
+
+        A real gene almost never carries more than 2-3 exons of UTR on either
+        end.  When the consensus shows 3+ UTR exons on one side of the CDS,
+        the locus is typically two neighboring genes merged by a bridging
+        template.  StringTie usually keeps them separate because it follows
+        read coverage without chaining through cross-gene junctions.
+
+        For each suspect gene: locate a pair of non-overlapping StringTie
+        transcripts that together cover the locus, pick the inter-cluster
+        gap that falls outside any CDS, partition the gene's exons at
+        StringTie-informed boundaries, and re-validate each half (canonical
+        splices, impossible introns, zero-coverage trim) before re-deriving
+        CDS and UTRs via ORFFinder.  Veto the split if either half lacks a
+        >=100 aa ORF or loses all exons during validation.
+        """
+        MIN_UTR_EXONS = 3
+        MIN_ST_GAP = 50
+        MIN_ORF_NT = 300
+
+        result = []
+        orf_finder = ORFFinder(self.genome)
+        n_split = 0
+
+        for gene in genes:
+            if gene.attributes.get('manual_annotation') == 'true':
+                result.append(gene)
+                continue
+            if not gene.transcripts:
+                result.append(gene)
+                continue
+
+            trigger = any(
+                len(tx.five_prime_utrs) >= MIN_UTR_EXONS
+                or len(tx.three_prime_utrs) >= MIN_UTR_EXONS
+                for tx in gene.transcripts)
+            if not trigger:
+                result.append(gene)
+                continue
+
+            # Collect StringTie transcripts inside gene footprint, same strand
+            st_txs = []
+            for stg in self.st_genes:
+                if stg.seqid != gene.seqid:
+                    continue
+                if stg.strand != gene.strand and stg.strand != '.':
+                    continue
+                for stx in stg.transcripts:
+                    if (stx.start >= gene.start - 100
+                            and stx.end <= gene.end + 100
+                            and stx.exons):
+                        st_txs.append(stx)
+            if len(st_txs) < 2:
+                result.append(gene)
+                continue
+
+            # Cluster by transcript-level gaps
+            st_txs.sort(key=lambda t: t.start)
+            clusters = [[st_txs[0]]]
+            for stx in st_txs[1:]:
+                prev_end = max(t.end for t in clusters[-1])
+                if stx.start > prev_end + MIN_ST_GAP:
+                    clusters.append([stx])
+                else:
+                    clusters[-1].append(stx)
+            if len(clusters) < 2:
+                result.append(gene)
+                continue
+
+            did_split = False
+            for ci in range(len(clusters) - 1):
+                gap_start = max(t.end for t in clusters[ci]) + 1
+                gap_end = min(t.start for t in clusters[ci + 1]) - 1
+                if gap_end < gap_start:
+                    continue
+
+                cds_in_gap = any(
+                    c.start <= gap_end and c.end >= gap_start
+                    for tx in gene.transcripts for c in tx.cds)
+                if cds_in_gap:
+                    continue
+
+                halves = self._build_utr_split_halves(
+                    gene, gap_start, gap_end,
+                    clusters[ci], clusters[ci + 1],
+                    orf_finder, MIN_ORF_NT)
+                if halves is None:
+                    continue
+
+                left_gene, right_gene = halves
+                logger.info(
+                    f"Step 5h.5: Splitting {gene.gene_id} at gap "
+                    f"{gap_start}-{gap_end} -> "
+                    f"{left_gene.gene_id} ({left_gene.start}-{left_gene.end}) + "
+                    f"{right_gene.gene_id} ({right_gene.start}-{right_gene.end})")
+                if self.tracer.enabled and self.tracer.matches(gene):
+                    self.tracer.event(
+                        "_split_excessive_utr_genes",
+                        f"{gene.gene_id} -> {left_gene.gene_id} + {right_gene.gene_id} "
+                        f"(gap {gap_start}-{gap_end})")
+                result.extend([left_gene, right_gene])
+                n_split += 1
+                did_split = True
+                break
+
+            if not did_split:
+                result.append(gene)
+
+        if n_split:
+            logger.info(f"  Step 5h.5: Split {n_split} merged gene(s) "
+                        f"via StringTie evidence")
+        return result
+
+    def _build_utr_split_halves(self, gene: Gene, gap_start: int, gap_end: int,
+                                 left_st: list, right_st: list,
+                                 orf_finder: 'ORFFinder', min_orf_nt: int):
+        """Build two validated half-genes from a gene partitioned at a gap.
+
+        Uses StringTie exon boundaries to decide where exons that span the gap
+        should be truncated.  Each half is re-validated with the same splice-
+        canonical/coverage/intron helpers used in Step 2 and then handed to
+        ORFFinder.reassign_cds to rebuild CDS + UTRs.  Returns None if either
+        half fails ORF length, canonicalization, or coverage checks.
+        """
+        left_st_exons = [e for tx in left_st for e in tx.exons
+                         if e.end <= gap_end]
+        right_st_exons = [e for tx in right_st for e in tx.exons
+                          if e.start >= gap_start]
+        if not left_st_exons or not right_st_exons:
+            return None
+        left_boundary = max(e.end for e in left_st_exons)
+        right_boundary = min(e.start for e in right_st_exons)
+        if left_boundary >= right_boundary:
+            return None
+
+        base_tx = max(gene.transcripts, key=lambda t: len(t.exons))
+        gene_exons = sorted(base_tx.exons, key=lambda e: e.start)
+
+        left_exons, right_exons = [], []
+        for e in gene_exons:
+            if e.end <= left_boundary:
+                left_exons.append(e)
+            elif e.start >= right_boundary:
+                right_exons.append(e)
+            elif e.start < left_boundary and e.end > right_boundary:
+                left_exons.append(Feature(
+                    seqid=e.seqid, source=e.source, ftype='exon',
+                    start=e.start, end=left_boundary, score=e.score,
+                    strand=e.strand, phase=e.phase,
+                    attributes=dict(e.attributes)))
+                right_exons.append(Feature(
+                    seqid=e.seqid, source=e.source, ftype='exon',
+                    start=right_boundary, end=e.end, score=e.score,
+                    strand=e.strand, phase=e.phase,
+                    attributes=dict(e.attributes)))
+            # else: exon entirely inside gap — drop
+        if not left_exons or not right_exons:
+            return None
+
+        # ORF quality gate before we commit to the split
+        for exons in (left_exons, right_exons):
+            ev_starts = self.evidence_index.get_evidence_cds_starts(
+                gene.seqid, gene.strand,
+                min(e.start for e in exons), max(e.end for e in exons))
+            orf = orf_finder.find_best_orf(
+                gene.seqid, exons, gene.strand,
+                coverage=self.coverage, evidence_cds_starts=ev_starts)
+            if not orf or (orf[1] - orf[0] + 1) < min_orf_nt:
+                return None
+
+        def _finalize(suffix: str, exons: List[Feature]) -> Gene:
+            new_gene = Gene(
+                gene_id=f"{gene.gene_id}_split{suffix}",
+                seqid=gene.seqid, strand=gene.strand,
+                start=min(e.start for e in exons),
+                end=max(e.end for e in exons),
+                source='Refined',
+                attributes=dict(gene.attributes))
+            new_gene.attributes['ID'] = new_gene.gene_id
+            new_gene.attributes['split_from'] = gene.gene_id
+            new_tx = Transcript(
+                transcript_id=f"{new_gene.gene_id}.1",
+                seqid=gene.seqid, strand=gene.strand,
+                start=new_gene.start, end=new_gene.end, source='Refined')
+            new_tx.exons = list(exons)
+            new_gene.transcripts.append(new_tx)
+
+            new_tx.exons = [e for e in new_tx.exons if e.length >= MIN_EXON_SIZE]
+            new_tx.exons = filter_impossible_introns(new_tx.exons)
+            if self.coverage.available:
+                new_tx.exons = self._merge_exons_by_coverage(
+                    gene.seqid, new_tx.exons, gene.strand)
+                new_tx = remove_zero_coverage_internal_exons(
+                    new_tx, self.coverage, self.genome,
+                    gene.seqid, gene.strand)
+            new_tx.exons = enforce_canonical_splice_sites(
+                self.genome, gene.seqid, new_tx.exons, gene.strand,
+                bam_evidence=self.bam_evidence)
+            new_tx.exons = self._remove_noncanonical_exons(
+                gene.seqid, new_tx.exons, gene.strand)
+            new_tx = trim_zero_coverage_terminal_exons(
+                new_tx, self.coverage, gene.seqid, gene.strand)
+
+            new_gene = orf_finder.reassign_cds(
+                new_gene, coverage=self.coverage,
+                evidence_index=self.evidence_index)
+            self._recompute_gene_boundaries(new_gene)
+            return new_gene
+
+        left_gene = _finalize('A', left_exons)
+        right_gene = _finalize('B', right_exons)
+
+        for g in (left_gene, right_gene):
+            if (not g.transcripts or not g.transcripts[0].exons
+                    or not g.transcripts[0].cds):
+                return None
+            cds_len = sum(c.length for c in g.transcripts[0].cds)
+            if cds_len < min_orf_nt:
+                return None
+
+        return left_gene, right_gene
 
     def _evaluate_merges(self, genes: List[Gene]) -> List[Gene]:
         """Evaluate and perform gene merges."""
