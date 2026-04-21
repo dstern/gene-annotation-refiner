@@ -3252,6 +3252,37 @@ class GeneMerger:
                         f"donor={donor_di} acceptor={acceptor_di})")
                 return False
 
+        # Prospective UTR-exon check: if the merge would leave >=3 exons in
+        # the "middle zone" between the two donors' CDS regions, each becomes
+        # a UTR exon of the combined gene.  Real genes almost never carry
+        # that many UTR exons on one side of their CDS, so this pattern is a
+        # strong signal of two neighboring genes being wrongly joined.  This
+        # is the cheap prospective counterpart of Step 5h.5's excessive-UTR
+        # split and avoids paying for the merge + later split round-trip.
+        u_tx = upstream.transcripts[0] if upstream.transcripts else None
+        d_tx = downstream.transcripts[0] if downstream.transcripts else None
+        if u_tx and u_tx.cds and d_tx and d_tx.cds:
+            u_cds_min = min(c.start for c in u_tx.cds)
+            u_cds_max = max(c.end for c in u_tx.cds)
+            d_cds_min = min(c.start for c in d_tx.cds)
+            d_cds_max = max(c.end for c in d_tx.cds)
+            if upstream.strand == '+':
+                u_middle = sum(1 for e in u_tx.exons if e.start > u_cds_max)
+                d_middle = sum(1 for e in d_tx.exons if e.end < d_cds_min)
+            else:
+                u_middle = sum(1 for e in u_tx.exons if e.end < u_cds_min)
+                d_middle = sum(1 for e in d_tx.exons if e.start > d_cds_max)
+            middle_utr = u_middle + d_middle
+            if middle_utr >= 3:
+                if self.tracer.enabled and self.tracer.pair_matches(
+                        upstream, downstream):
+                    self.tracer.event(
+                        "should_merge",
+                        f"{upstream.gene_id} x {downstream.gene_id}: REJECT "
+                        f"(would produce {middle_utr} middle-zone UTR exons; "
+                        f"up_post_cds={u_middle} down_pre_cds={d_middle})")
+                return False
+
         evidence_count = 0
         evidence_required = 2
         # Require more evidence for larger gaps
