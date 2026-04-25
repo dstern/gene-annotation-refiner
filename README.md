@@ -1,19 +1,19 @@
 # Gene Annotation Refiner
 
-A Python pipeline that integrates multiple evidence sources to produce a refined, probabilistically scored gene annotation from insect genome data. Developed for *Acyrthosiphon pisum* (pea aphid) and generalizable to other arthropod genomes.
+A Python pipeline that integrates multiple gene model outputs (gff files) and evidence sources (RNA seq converage and junctions) to produce a refined gene annotation. Each element receives a support score from 0-1.
 
 ## Overview
 
-Gene annotation in insects is challenging because no single method is sufficient: *ab initio* ML models miss UTRs and get splice sites wrong; RNA-seq assemblers produce fragmented or chimeric transcripts; and TransDecoder CDS predictions lack exon structure. This pipeline combines all of these into a unified GFF3 output where every gene, transcript, exon, intron, and CDS feature carries a posterior probability reflecting the strength of multi-source evidence.
+Annotation of new genomes is challenging and no single gene annotation pipeline provides results that are consistent with evidence. This pipeline combines gene model predictions from multiple pipelines, provided as gff files, and determines to what extent RNAseq evidence support each element. Genes are combined or split based on junction evidence and terminal exons are added (or removed) based on presence (or absence) of RNA seq evidence for additional exons beyond the prediction boundaries of any single gff file. Each gene, transcript, exon, intron, and CDS are provided with a confidence score (between 0-1) reflecting the strength of multi-source evidence.
 
 **Supported evidence types**
 
 | Input | Flag | Purpose |
 |---|---|---|
-| Genome FASTA | `--genome` | Sequence for splice-site PWM scoring and ORF finding |
+| Genome FASTA | `--genome` | Genome sequence for splice-site PWM scoring and ORF finding |
 | Helixer predictions | `--helixer` | ML-based gene structure (coding regions, intron/exon boundaries) |
 | StringTie transcripts | `--stringtie` | RNA-seq-derived transcript models |
-| TransDecoder CDS | `--transdecoder` | CDS predictions from long-read or short-read RNA-seq |
+| TransDecoder CDS | `--transdecoder` | Exons and CDS predictions from long-read or short-read RNA-seq |
 | RNA-seq BigWig | `--bigwig` | Per-base read coverage for exon validation |
 | Portcullis/STAR junctions | `--junctions` | Pre-computed splice junction read counts (recommended) |
 | BAM alignments | `--bam` | Alternative to `--junctions`; slower, re-scans reads per intron |
