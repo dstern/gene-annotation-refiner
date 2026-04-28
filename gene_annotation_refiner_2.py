@@ -5207,6 +5207,15 @@ class GeneAnnotationRefiner:
             logger.warning(f"  Removed {n_invalid} genes with invalid boundaries")
         self.tracer.snapshot("After Step 5i (repair/boundaries)", consensus_genes)
 
+        # Step 5j: Add alternative coding isoforms from TransDecoder.
+        # TD models are isoform-resolved; consensus building collapses
+        # them to one transcript per gene.  Recover divergent isoforms
+        # whose CDS substantially overlaps the primary CDS but whose
+        # 5'/3' end or splice structure differs significantly.
+        logger.info("\nStep 5j: Adding alternative coding isoforms from TransDecoder...")
+        self._add_alternative_isoforms(consensus_genes, orf_finder)
+        self.tracer.snapshot("After Step 5j (alt isoforms)", consensus_genes)
+
         # Step 6: Compute posterior probabilities
         logger.info("\nStep 6: Computing posterior probabilities...")
         # Remove genes with no valid transcripts remaining
@@ -7900,6 +7909,179 @@ class GeneAnnotationRefiner:
 
         if n_dropped:
             logger.info(f"  Step 5h.4: Dropped {n_dropped} weak internal exon(s)")
+
+    def _add_alternative_isoforms(self, genes: List[Gene],
+                                    orf_finder: 'ORFFinder') -> None:
+        """Add alternative coding isoforms from TransDecoder evidence.
+
+        For each refined gene, scan TD transcripts whose CDS substantially
+        overlaps the primary CDS.  Add a TD transcript as an additional
+        isoform when:
+          - it differs from all already-accepted isoforms by ≥150 bp at
+            either end, or has at least one unique internal splice site,
+          - all of its introns have ≥3 junction reads (or it has no
+            introns), and pass the stranded antisense veto if available,
+          - its CDS yields an ORF ≥75% of the primary ORF length and ends
+            in a stop codon.
+        Caps at 3 isoforms per gene.
+        """
+        if not self.td_genes:
+            return
+
+        MIN_END_DIFF   = 150
+        MAX_ISOFORMS   = 3
+        MIN_REL_ORF    = 0.75
+        MIN_JUNC_READS = 3
+        MIN_CDS_OVL    = 0.50  # reciprocal overlap of CDS spans
+
+        td_by_region = defaultdict(list)
+        for tg in self.td_genes:
+            td_by_region[(tg.seqid, tg.strand)].append(tg)
+
+        n_added = 0
+        for gene in genes:
+            if gene.attributes.get('manual_annotation') == 'true':
+                continue
+            if not gene.transcripts or not gene.transcripts[0].cds:
+                continue
+            primary = gene.transcripts[0]
+            primary_cds_min = min(c.start for c in primary.cds)
+            primary_cds_max = max(c.end for c in primary.cds)
+            primary_cds_len = sum(c.end - c.start + 1 for c in primary.cds)
+            primary_span = primary_cds_max - primary_cds_min + 1
+
+            candidates = []
+            for tg in td_by_region.get((gene.seqid, gene.strand), []):
+                if tg.end < gene.start or tg.start > gene.end:
+                    continue
+                for ttx in tg.transcripts:
+                    if not ttx.cds or not ttx.exons:
+                        continue
+                    tcds_min = min(c.start for c in ttx.cds)
+                    tcds_max = max(c.end for c in ttx.cds)
+                    ov = min(tcds_max, primary_cds_max) - max(tcds_min, primary_cds_min)
+                    if ov <= 0:
+                        continue
+                    td_span = tcds_max - tcds_min + 1
+                    if ov < MIN_CDS_OVL * min(primary_span, td_span):
+                        continue
+                    candidates.append(ttx)
+
+            if not candidates:
+                continue
+
+            # Sort candidates by ORF length, longest first
+            candidates.sort(
+                key=lambda t: -sum(c.end - c.start + 1 for c in t.cds))
+
+            accepted = [primary]
+            for cand in candidates:
+                if len(accepted) >= MAX_ISOFORMS:
+                    break
+                if not all(self._isoforms_differ(cand, ex_tx, MIN_END_DIFF)
+                           for ex_tx in accepted):
+                    continue
+                if not self._isoform_introns_supported(
+                        gene.seqid, cand, MIN_JUNC_READS):
+                    continue
+                alt_orf_len = sum(c.end - c.start + 1 for c in cand.cds)
+                if alt_orf_len < MIN_REL_ORF * primary_cds_len:
+                    continue
+                if not has_stop_codon(self.genome, gene.seqid, cand.cds, gene.strand):
+                    continue
+                if not self._isoform_coverage_ok(gene, cand):
+                    continue
+
+                # Build a clean Transcript copy attached to this gene
+                alt_tx = Transcript(
+                    transcript_id=f"{gene.gene_id}.alt",
+                    seqid=gene.seqid, strand=gene.strand,
+                    start=min(e.start for e in cand.exons),
+                    end=max(e.end for e in cand.exons),
+                    source='Refined')
+                alt_tx.exons = [Feature(seqid=e.seqid, source='Refined',
+                                         ftype='exon',
+                                         start=e.start, end=e.end,
+                                         score=e.score, strand=e.strand,
+                                         phase='.', attributes=dict(e.attributes))
+                                for e in cand.exons]
+                alt_tx.cds = [Feature(seqid=c.seqid, source='Refined',
+                                       ftype='CDS',
+                                       start=c.start, end=c.end,
+                                       score=c.score, strand=c.strand,
+                                       phase=c.phase, attributes=dict(c.attributes))
+                              for c in cand.cds]
+                # Re-derive UTRs from exons + CDS using ORFFinder helper
+                alt_tx.five_prime_utrs = []
+                alt_tx.three_prime_utrs = []
+                orf_finder._derive_utrs(alt_tx, gene.strand)
+                accepted.append(alt_tx)
+                n_added += 1
+                logger.info(
+                    f"  Step 5j: {gene.gene_id} added alt isoform "
+                    f"(exons={len(alt_tx.exons)}, ORF={alt_orf_len} nt, "
+                    f"primary ORF={primary_cds_len} nt)")
+
+            if len(accepted) > 1:
+                gene.transcripts = accepted
+                self._recompute_gene_boundaries(gene)
+
+        if n_added:
+            logger.info(f"  Step 5j: Added {n_added} alternative isoform(s)")
+
+    @staticmethod
+    def _isoforms_differ(tx_a, tx_b, min_end_diff: int) -> bool:
+        """True if two transcripts differ enough to count as distinct
+        isoforms: 5' or 3' boundary differs by ≥ min_end_diff bp, OR they
+        have at least one unique internal splice site."""
+        a_start = min(e.start for e in tx_a.exons)
+        a_end   = max(e.end for e in tx_a.exons)
+        b_start = min(e.start for e in tx_b.exons)
+        b_end   = max(e.end for e in tx_b.exons)
+        if abs(a_start - b_start) >= min_end_diff:
+            return True
+        if abs(a_end - b_end) >= min_end_diff:
+            return True
+        # Compare internal splice sites
+        a_introns = set()
+        sa = sorted(tx_a.exons, key=lambda e: e.start)
+        for i in range(len(sa) - 1):
+            a_introns.add((sa[i].end, sa[i+1].start))
+        b_introns = set()
+        sb = sorted(tx_b.exons, key=lambda e: e.start)
+        for i in range(len(sb) - 1):
+            b_introns.add((sb[i].end, sb[i+1].start))
+        return bool(a_introns ^ b_introns)
+
+    def _isoform_introns_supported(self, seqid: str, tx,
+                                     min_reads: int) -> bool:
+        """Every intron of `tx` has ≥ min_reads junction support."""
+        if not self.bam_evidence.available:
+            # No junctions data: can't validate, accept by default
+            return True
+        sorted_exons = sorted(tx.exons, key=lambda e: e.start)
+        for i in range(len(sorted_exons) - 1):
+            donor = sorted_exons[i].end
+            acceptor = sorted_exons[i+1].start
+            reads_d = self.bam_evidence.reads_at_donor(seqid, donor, tolerance=2)
+            reads_a = self.bam_evidence.reads_at_acceptor(seqid, acceptor, tolerance=2)
+            if min(reads_d, reads_a) < min_reads:
+                return False
+        return True
+
+    def _isoform_coverage_ok(self, gene: Gene, tx) -> bool:
+        """Mean coverage over alt-only exonic regions must clear the
+        unstranded floor and pass the stranded veto if available."""
+        if not self.coverage.available:
+            return True
+        for ex in tx.exons:
+            cov = self.coverage.get_mean_coverage(gene.seqid, ex.start, ex.end)
+            if cov < 1.0:
+                return False
+            if not self._passes_strand_check(
+                    gene.seqid, ex.start, ex.end, gene.strand, cov):
+                return False
+        return True
 
     def _split_excessive_utr_genes(self, genes: List[Gene]) -> List[Gene]:
         """Split genes flagged by an excessive UTR-exon count using StringTie evidence.
