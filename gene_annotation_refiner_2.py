@@ -55,6 +55,14 @@ Splice junction evidence:
     If both --bam and --junctions are given, --junctions is used.
     Coverage is always read from --bigwig (not the BAM).
 
+    --bigwig, --bigwig_fwd, --bigwig_rev, --bam, and --junctions all
+    accept multiple files. For bigwigs, per-base values are summed
+    across files; for junctions, junctions are merged and read counts
+    summed across files; for BAMs, queries iterate over all files and
+    counts are summed. Example:
+        --bigwig sample1.bw sample2.bw sample3.bw
+        --junctions sample1.tab sample2.tab
+
 Stranded coverage (optional, recommended when stranded libraries are
 available):
     --bigwig is the primary unstranded coverage track (built from all
@@ -2795,32 +2803,67 @@ def _pick_best_exon_boundary(seqid: str, strand: str, which: str,
 # Coverage analysis
 # ============================================================================
 class CoverageAccess:
-    """Access RNA-seq coverage from bigwig file."""
+    """Access RNA-seq coverage from one or more bigwig files.
 
-    def __init__(self, bigwig_path: str):
+    When multiple paths are supplied, per-base values are summed across
+    all files (treat them as replicates contributing additively to the
+    coverage signal).
+    """
+
+    def __init__(self, bigwig_path):
         import pyBigWig
-        self.bw = pyBigWig.open(bigwig_path)
-        self.chroms = self.bw.chroms()
+        if isinstance(bigwig_path, str):
+            paths = [bigwig_path]
+        else:
+            paths = list(bigwig_path)
+        self.bws = [pyBigWig.open(p) for p in paths]
+        self.paths = paths
+        # Union of chroms across all files; record per-file lengths for
+        # bounds clipping.
+        self.chroms = {}
+        for bw in self.bws:
+            for c, L in bw.chroms().items():
+                self.chroms[c] = max(self.chroms.get(c, 0), L)
+        # Backwards compatibility -- single primary handle
+        self.bw = self.bws[0] if self.bws else None
         self.available = True
         self._mean_cov_cache: dict = {}
+        if len(paths) > 1:
+            logger.info(f"  CoverageAccess: summing {len(paths)} bigwig files")
 
     def get_coverage(self, seqid: str, start: int, end: int) -> 'np.ndarray':
-        """Get per-bp coverage for a region (0-based coords for bigwig)."""
+        """Get per-bp coverage for a region (0-based coords for bigwig).
+        Sums across all loaded bigwig files."""
         if start is None or end is None or start > end or start < 1:
             return np.zeros(0)
         if seqid not in self.chroms:
             return np.zeros(max(0, end - start))
-        # BigWig uses 0-based half-open coordinates
-        # GFF uses 1-based inclusive, so GFF start=X -> BW start=X-1
         bw_start = max(0, start - 1)
         bw_end = min(end, self.chroms[seqid])
         if bw_start >= bw_end:
             return np.zeros(max(0, end - start))
-        try:
-            vals = self.bw.values(seqid, bw_start, bw_end)
-            return np.array([v if v is not None and not np.isnan(v) else 0.0 for v in vals])
-        except Exception:
+        accum = None
+        for bw in self.bws:
+            chroms = bw.chroms()
+            if seqid not in chroms:
+                continue
+            local_end = min(bw_end, chroms[seqid])
+            if local_end <= bw_start:
+                continue
+            try:
+                vals = bw.values(seqid, bw_start, local_end)
+                arr = np.array([v if v is not None and not np.isnan(v) else 0.0
+                                for v in vals])
+            except Exception:
+                arr = np.zeros(local_end - bw_start)
+            # Pad to the requested length if this file is shorter
+            if len(arr) < (bw_end - bw_start):
+                arr = np.concatenate([arr,
+                                       np.zeros(bw_end - bw_start - len(arr))])
+            accum = arr if accum is None else accum + arr
+        if accum is None:
             return np.zeros(max(0, bw_end - bw_start))
+        return accum
 
     def get_mean_coverage(self, seqid: str, start: int, end: int) -> float:
         """Get mean coverage for a region. Results are cached to avoid redundant BigWig queries."""
@@ -2875,7 +2918,11 @@ class CoverageAccess:
         return max(0.0, 1.0 - ratio)
 
     def close(self):
-        self.bw.close()
+        for bw in self.bws:
+            try:
+                bw.close()
+            except Exception:
+                pass
 
 
 class StrandedCoverage:
@@ -4132,6 +4179,78 @@ class SplicedReadEvidence:
         self.bam.close()
 
 
+class MultiSplicedReadEvidence:
+    """Aggregate queries across multiple BAM files.
+
+    Holds a list of SplicedReadEvidence handles and forwards each method,
+    summing read counts (count_spliced_reads, reads_at_donor,
+    reads_at_acceptor) or merging junction lists (find_novel_junctions,
+    find_junctions_starting_in, find_junctions_ending_in).
+    """
+
+    def __init__(self, paths):
+        self._handles = [SplicedReadEvidence(p) for p in paths]
+        self._handles = [h for h in self._handles if getattr(h, 'available', False)]
+        self.available = bool(self._handles)
+        if self.available:
+            logger.info(f"  MultiSplicedReadEvidence: aggregating "
+                        f"{len(self._handles)} BAM file(s)")
+
+    # Sum-style queries
+    def count_spliced_reads(self, *args, **kwargs) -> int:
+        return sum(h.count_spliced_reads(*args, **kwargs) for h in self._handles)
+
+    def reads_at_donor(self, *args, **kwargs) -> int:
+        return sum(h.reads_at_donor(*args, **kwargs) for h in self._handles)
+
+    def reads_at_acceptor(self, *args, **kwargs) -> int:
+        return sum(h.reads_at_acceptor(*args, **kwargs) for h in self._handles)
+
+    def has_junction_support(self, *args, **kwargs) -> bool:
+        return self.count_spliced_reads(*args, **kwargs) >= kwargs.get('min_reads', 2)
+
+    # Merge-style queries: concatenate per-file (j_start, j_end, count) tuples,
+    # then collapse identical (j_start, j_end) by summing counts.
+    def _merge_junctions(self, lists):
+        merged = {}
+        for lst in lists:
+            for js, je, jc in lst:
+                merged[(js, je)] = merged.get((js, je), 0) + jc
+        return [(js, je, jc) for (js, je), jc in merged.items()]
+
+    def find_novel_junctions(self, *args, **kwargs):
+        return self._merge_junctions(
+            [h.find_novel_junctions(*args, **kwargs) for h in self._handles])
+
+    def find_junctions_starting_in(self, *args, **kwargs):
+        return self._merge_junctions(
+            [h.find_junctions_starting_in(*args, **kwargs)
+             for h in self._handles
+             if hasattr(h, 'find_junctions_starting_in')])
+
+    def find_junctions_ending_in(self, *args, **kwargs):
+        return self._merge_junctions(
+            [h.find_junctions_ending_in(*args, **kwargs)
+             for h in self._handles
+             if hasattr(h, 'find_junctions_ending_in')])
+
+    def get_intron_support(self, gene):
+        result = {}
+        if not gene.transcripts:
+            return result
+        for intron_start, intron_end in gene.transcripts[0].introns():
+            result[(intron_start, intron_end)] = self.count_spliced_reads(
+                gene.seqid, intron_start, intron_end)
+        return result
+
+    def close(self):
+        for h in self._handles:
+            try:
+                h.close()
+            except Exception:
+                pass
+
+
 class JunctionFileEvidence:
     """Pre-computed splice junction evidence from Portcullis or similar tools.
 
@@ -4147,20 +4266,33 @@ class JunctionFileEvidence:
       and an integer read count in columns 5+ (auto-detected)
     """
 
-    def __init__(self, junction_path: str):
+    def __init__(self, junction_path):
         self.available = True
-        # Dict: (seqid, intron_start, intron_end) -> read_count
+        # Dict: (seqid, intron_start, intron_end) -> read_count (summed across files)
         self._junctions = {}
-        # Interval index for region queries: seqid -> sorted list of (start, end, count)
+        # Interval index built from the merged dict (so per-junction reads are
+        # counted once even when present in multiple files).
         self._by_seqid = defaultdict(list)
 
-        n_loaded = self._load(junction_path)
-        # Build sorted index for region queries
+        if isinstance(junction_path, str):
+            paths = [junction_path]
+        else:
+            paths = list(junction_path)
+
+        total = 0
+        for p in paths:
+            total += self._load(p)
+            logger.info(f"Junction file loaded: {p}")
+
+        # Build sorted index from merged dict
+        self._by_seqid.clear()
+        for (seqid, js, je), count in self._junctions.items():
+            self._by_seqid[seqid].append((js, je, count))
         for seqid in self._by_seqid:
             self._by_seqid[seqid].sort()
 
-        logger.info(f"Junction file loaded: {junction_path}")
-        logger.info(f"  {n_loaded} splice junctions loaded")
+        logger.info(f"  {len(self._junctions)} unique splice junctions loaded "
+                    f"({total} records read across {len(paths)} file(s))")
         seqids = sorted(self._by_seqid.keys())
         logger.info(f"  Sequences: {len(seqids)} ({', '.join(seqids[:5])}{'...' if len(seqids) > 5 else ''})")
 
@@ -4685,21 +4817,35 @@ class GeneAnnotationRefiner:
             pwm_builder = SplicePWMBuilder(self.genome)
             DONOR_PWM, ACCEPTOR_PWM = pwm_builder._fallback_pwm(self.pwm_organism)
 
-        # Load splice junction evidence (prefer pre-computed junctions over BAM)
-        if junctions_path and os.path.exists(junctions_path):
-            logger.info(f"Loading pre-computed junctions: {junctions_path}")
-            self.bam_evidence = JunctionFileEvidence(junctions_path)
-            if bam_path:
+        # Load splice junction evidence (prefer pre-computed junctions over BAM).
+        # Both inputs accept a single path or a list of paths.
+        def _to_existing_list(p):
+            if not p:
+                return []
+            paths = [p] if isinstance(p, str) else list(p)
+            return [x for x in paths if x and os.path.exists(x)]
+
+        junc_paths = _to_existing_list(junctions_path)
+        bam_paths = _to_existing_list(bam_path)
+        if junc_paths:
+            logger.info(f"Loading pre-computed junctions: "
+                        f"{len(junc_paths)} file(s)")
+            self.bam_evidence = JunctionFileEvidence(junc_paths)
+            if bam_paths:
                 logger.info("  --junctions provided; --bam will be ignored for "
                            "junction evidence")
-        elif bam_path and os.path.exists(bam_path):
-            logger.info(f"Loading BAM file: {bam_path}")
-            self.bam_evidence = SplicedReadEvidence(bam_path)
+        elif bam_paths:
+            logger.info(f"Loading BAM file(s): {len(bam_paths)}")
+            if len(bam_paths) == 1:
+                self.bam_evidence = SplicedReadEvidence(bam_paths[0])
+            else:
+                self.bam_evidence = MultiSplicedReadEvidence(bam_paths)
         else:
             if junctions_path:
-                logger.warning(f"Junctions file not found: {junctions_path}")
+                logger.warning(f"Junctions file(s) not found: {junctions_path}")
             if bam_path:
-                logger.warning(f"BAM file not found: {bam_path}; proceeding without BAM evidence")
+                logger.warning(f"BAM file(s) not found: {bam_path}; "
+                              f"proceeding without BAM evidence")
             else:
                 logger.info("No BAM or junctions file provided; splice junction "
                            "evidence from reads unavailable")
@@ -8884,30 +9030,37 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
                                 'etc.). Requires --bigwig.')
 
     # Evidence data
-    parser.add_argument('--bigwig', default=None,
-                        help='RNA-seq coverage bigwig (recommended). Built from '
-                             'all libraries (stranded + unstranded) — used as '
-                             'the primary coverage signal throughout the pipeline.')
-    parser.add_argument('--bigwig_fwd', default=None,
-                        help='Optional same-strand bigwig for transcripts on '
+    parser.add_argument('--bigwig', default=None, nargs='+',
+                        help='RNA-seq coverage bigwig(s) (recommended). One or '
+                             'more files; values are summed across files. Built '
+                             'from all libraries (stranded + unstranded) — used '
+                             'as the primary coverage signal throughout the '
+                             'pipeline.')
+    parser.add_argument('--bigwig_fwd', default=None, nargs='+',
+                        help='Optional same-strand bigwig(s) for transcripts on '
                              'the + strand (e.g. deepTools '
                              '`bamCoverage --filterRNAstrand forward` from '
-                             'stranded libraries only). Used as a veto: if '
-                             'same-strand coverage is near-zero where the '
-                             'unstranded bigwig shows support, the support is '
-                             'rejected as antisense leakage. Currently applied '
-                             'in Phase 4.5 (terminal-exon UTR extension) and '
-                             'Step 5g.5 (downstream-exon recovery). Requires '
-                             '--bigwig_rev.')
-    parser.add_argument('--bigwig_rev', default=None,
-                        help='Same-strand bigwig for transcripts on the − strand. '
+                             'stranded libraries only). One or more files; '
+                             'values are summed. Used as a veto: if same-strand '
+                             'coverage is near-zero where the unstranded bigwig '
+                             'shows support, the support is rejected as '
+                             'antisense leakage. Applied in Phase 4.5 '
+                             '(terminal-exon UTR extension) and Step 5g.5 '
+                             '(downstream-exon recovery). Requires --bigwig_rev.')
+    parser.add_argument('--bigwig_rev', default=None, nargs='+',
+                        help='Same-strand bigwig(s) for transcripts on the − '
+                             'strand. One or more files; values are summed. '
                              'Pairs with --bigwig_fwd.')
-    parser.add_argument('--bam', default=None,
-                        help='RNA-seq BAM file (optional, for splice junction evidence)')
-    parser.add_argument('--junctions', default=None,
-                        help='Pre-computed splice junction file (Portcullis .tab, '
-                             'STAR SJ.out.tab, or BED). Much faster than --bam. '
-                             'If both --bam and --junctions are provided, --junctions '
+    parser.add_argument('--bam', default=None, nargs='+',
+                        help='RNA-seq BAM file(s) (optional, for splice junction '
+                             'evidence). One or more files; junction read '
+                             'counts are summed across files.')
+    parser.add_argument('--junctions', default=None, nargs='+',
+                        help='Pre-computed splice junction file(s) (Portcullis '
+                             '.tab, STAR SJ.out.tab, or BED). Much faster than '
+                             '--bam. One or more files; junctions are merged '
+                             'and read counts summed across files. If both '
+                             '--bam and --junctions are provided, --junctions '
                              'is used and --bam is ignored.')
 
     # Naming and renumbering options
@@ -8982,6 +9135,8 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         '--stringtie':          args.stringtie,
         '--transdecoder':       args.transdecoder,
         '--bigwig':             args.bigwig,
+        '--bigwig_fwd':         args.bigwig_fwd,
+        '--bigwig_rev':         args.bigwig_rev,
         '--bam':                args.bam,
         '--junctions':          args.junctions,
         '--manual_annotation':  args.manual_annotation,
@@ -8990,9 +9145,13 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         '--config':             args.config,
     }
     missing = []
-    for flag, path in file_args.items():
-        if path and not os.path.exists(path):
-            missing.append(f"  {flag}: {path}")
+    for flag, val in file_args.items():
+        if not val:
+            continue
+        paths = [val] if isinstance(val, str) else list(val)
+        for path in paths:
+            if not os.path.exists(path):
+                missing.append(f"  {flag}: {path}")
     if missing:
         logger.error("The following input files were not found — aborting before "
                      "starting the pipeline:\n" + "\n".join(missing))
