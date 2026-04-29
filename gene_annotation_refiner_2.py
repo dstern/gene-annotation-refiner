@@ -8014,29 +8014,82 @@ class GeneAnnotationRefiner:
                     continue
                 if not has_stop_codon(self.genome, gene.seqid, cand.cds, gene.strand):
                     continue
+                # Reject alt isoforms whose own structure already has 3+
+                # UTR exons on either end -- these are usually TD models
+                # that themselves merge two genes (the trailing exons are a
+                # separate gene's structure, not a real long UTR).
+                cand_cds_min = min(c.start for c in cand.cds)
+                cand_cds_max = max(c.end for c in cand.cds)
+                cand_sorted = sorted(cand.exons, key=lambda e: e.start)
+                if gene.strand == '+':
+                    n5 = sum(1 for e in cand_sorted if e.end < cand_cds_min)
+                    n3 = sum(1 for e in cand_sorted if e.start > cand_cds_max)
+                else:
+                    n5 = sum(1 for e in cand_sorted if e.start > cand_cds_max)
+                    n3 = sum(1 for e in cand_sorted if e.end < cand_cds_min)
+                if max(n5, n3) >= 3:
+                    continue
                 if not self._isoform_coverage_ok(gene, cand):
                     continue
 
                 # Build a clean Transcript copy attached to this gene
+                alt_exons = [Feature(seqid=e.seqid, source='Refined',
+                                      ftype='exon',
+                                      start=e.start, end=e.end,
+                                      score=e.score, strand=e.strand,
+                                      phase='.', attributes=dict(e.attributes))
+                             for e in cand.exons]
+
+                # TD transcripts often span only the CDS, missing the UTR
+                # exons present in the primary refined transcript.  Inherit
+                # primary's UTR exons that fall strictly outside the alt's
+                # exonic range, and extend the alt's terminal exon outward
+                # when it overlaps a primary exon that extends further into
+                # the UTR (UTR within the same first/last exon).
+                alt_lo = min(e.start for e in alt_exons)
+                alt_hi = max(e.end for e in alt_exons)
+                sorted_alt = sorted(alt_exons, key=lambda e: e.start)
+                primary_sorted = sorted(primary.exons, key=lambda e: e.start)
+
+                for pe in primary_sorted:
+                    if pe.end < alt_lo:
+                        alt_exons.append(Feature(
+                            seqid=pe.seqid, source='Refined', ftype='exon',
+                            start=pe.start, end=pe.end, score=pe.score,
+                            strand=pe.strand, phase='.',
+                            attributes=dict(pe.attributes)))
+                    elif pe.start > alt_hi:
+                        alt_exons.append(Feature(
+                            seqid=pe.seqid, source='Refined', ftype='exon',
+                            start=pe.start, end=pe.end, score=pe.score,
+                            strand=pe.strand, phase='.',
+                            attributes=dict(pe.attributes)))
+                    else:
+                        # Overlap with an alt exon -- extend the matching
+                        # alt exon outward if primary extends further
+                        if pe.start <= sorted_alt[0].end and pe.end >= sorted_alt[0].start:
+                            if pe.start < sorted_alt[0].start:
+                                sorted_alt[0].start = pe.start
+                        if pe.start <= sorted_alt[-1].end and pe.end >= sorted_alt[-1].start:
+                            if pe.end > sorted_alt[-1].end:
+                                sorted_alt[-1].end = pe.end
+
+                alt_exons.sort(key=lambda e: e.start)
+
                 alt_tx = Transcript(
                     transcript_id=f"{gene.gene_id}.alt",
                     seqid=gene.seqid, strand=gene.strand,
-                    start=min(e.start for e in cand.exons),
-                    end=max(e.end for e in cand.exons),
+                    start=min(e.start for e in alt_exons),
+                    end=max(e.end for e in alt_exons),
                     source='Refined')
-                alt_tx.exons = [Feature(seqid=e.seqid, source='Refined',
-                                         ftype='exon',
-                                         start=e.start, end=e.end,
-                                         score=e.score, strand=e.strand,
-                                         phase='.', attributes=dict(e.attributes))
-                                for e in cand.exons]
+                alt_tx.exons = alt_exons
                 alt_tx.cds = [Feature(seqid=c.seqid, source='Refined',
                                        ftype='CDS',
                                        start=c.start, end=c.end,
                                        score=c.score, strand=c.strand,
                                        phase=c.phase, attributes=dict(c.attributes))
                               for c in cand.cds]
-                # Re-derive UTRs from exons + CDS using ORFFinder helper
+                # Re-derive UTRs from expanded exons + CDS
                 alt_tx.five_prime_utrs = []
                 alt_tx.three_prime_utrs = []
                 orf_finder._derive_utrs(alt_tx, gene.strand)
@@ -8214,12 +8267,84 @@ class GeneAnnotationRefiner:
                 did_split = True
                 break
 
+            # If StringTie didn't yield a split, try TransDecoder evidence.
+            # When a TD transcript has a coding ORF inside the gene's
+            # footprint that doesn't overlap any current transcript's CDS,
+            # that's strong evidence for a missed gene split.  The gap is
+            # between the current gene CDS and the TD CDS.
+            if not did_split:
+                gene_cds_min = min(c.start for tx in gene.transcripts for c in tx.cds) \
+                    if any(tx.cds for tx in gene.transcripts) else None
+                gene_cds_max = max(c.end for tx in gene.transcripts for c in tx.cds) \
+                    if any(tx.cds for tx in gene.transcripts) else None
+
+                if gene_cds_min is not None:
+                    td_alt_txs = []
+                    for tg in self.td_genes:
+                        if tg.seqid != gene.seqid:
+                            continue
+                        if tg.strand != gene.strand and tg.strand != '.':
+                            continue
+                        for ttx in tg.transcripts:
+                            if not ttx.cds or not ttx.exons:
+                                continue
+                            tcds_min = min(c.start for c in ttx.cds)
+                            tcds_max = max(c.end for c in ttx.cds)
+                            # TD CDS must lie inside the gene footprint and
+                            # be entirely outside the gene's CDS span
+                            if tcds_min < gene.start or tcds_max > gene.end:
+                                continue
+                            if tcds_max >= gene_cds_min and tcds_min <= gene_cds_max:
+                                continue
+                            td_alt_txs.append((tcds_min, tcds_max, ttx))
+
+                    for tcds_min, tcds_max, ttx in td_alt_txs:
+                        # Determine left/right by genomic position
+                        if tcds_max < gene_cds_min:
+                            # TD is upstream of primary CDS
+                            gap_start = tcds_max + 1
+                            gap_end = gene_cds_min - 1
+                            left_evidence = [ttx]
+                            right_evidence = gene.transcripts
+                        else:
+                            # TD is downstream of primary CDS
+                            gap_start = gene_cds_max + 1
+                            gap_end = tcds_min - 1
+                            left_evidence = gene.transcripts
+                            right_evidence = [ttx]
+
+                        if gap_end < gap_start:
+                            continue
+
+                        halves = self._build_utr_split_halves(
+                            gene, gap_start, gap_end,
+                            left_evidence, right_evidence,
+                            orf_finder, MIN_ORF_NT)
+                        if halves is None:
+                            continue
+
+                        left_gene, right_gene = halves
+                        logger.info(
+                            f"Step 5h.5 (TD): Splitting {gene.gene_id} at gap "
+                            f"{gap_start}-{gap_end} -> "
+                            f"{left_gene.gene_id} ({left_gene.start}-{left_gene.end}) + "
+                            f"{right_gene.gene_id} ({right_gene.start}-{right_gene.end})")
+                        if self.tracer.enabled and self.tracer.matches(gene):
+                            self.tracer.event(
+                                "_split_excessive_utr_genes (TD)",
+                                f"{gene.gene_id} -> {left_gene.gene_id} + "
+                                f"{right_gene.gene_id} (gap {gap_start}-{gap_end})")
+                        result.extend([left_gene, right_gene])
+                        n_split += 1
+                        did_split = True
+                        break
+
             if not did_split:
                 result.append(gene)
 
         if n_split:
             logger.info(f"  Step 5h.5: Split {n_split} merged gene(s) "
-                        f"via StringTie evidence")
+                        f"via StringTie/TransDecoder evidence")
         return result
 
     def _build_utr_split_halves(self, gene: Gene, gap_start: int, gap_end: int,
