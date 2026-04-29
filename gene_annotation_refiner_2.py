@@ -8266,6 +8266,12 @@ class GeneAnnotationRefiner:
                 alt_tx.five_prime_utrs = []
                 alt_tx.three_prime_utrs = []
                 orf_finder._derive_utrs(alt_tx, gene.strand)
+                # UTR inheritance can collapse the alt's distinguishing 5'/3'
+                # boundary back onto the primary's boundary. Re-check that
+                # the expanded alt is still meaningfully different.
+                if not all(self._isoforms_differ(alt_tx, ex_tx, MIN_END_DIFF)
+                           for ex_tx in accepted):
+                    continue
                 accepted.append(alt_tx)
                 n_added += 1
                 logger.info(
