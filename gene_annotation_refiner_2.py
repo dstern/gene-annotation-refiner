@@ -9370,6 +9370,24 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
         sys.exit(1)
     else:
         logger.info("All provided input files found.")
+        # Echo every supplied input file with its absolute path so that
+        # the run log unambiguously records which evidence was used.
+        logger.info("Inputs in use:")
+        # --genome first, then GFF inputs, then evidence tracks
+        echo_order = [
+            '--genome', '--helixer', '--stringtie', '--transdecoder',
+            '--manual_annotation', '--refine_existing', '--name_from',
+            '--bigwig', '--bigwig_fwd', '--bigwig_rev',
+            '--bam', '--junctions', '--config',
+        ]
+        for flag in echo_order:
+            val = file_args.get(flag)
+            if not val:
+                continue
+            paths = [val] if isinstance(val, str) else list(val)
+            for p in paths:
+                logger.info(f"  {flag} {os.path.abspath(p)}")
+        logger.info(f"  --output {os.path.abspath(args.output)}")
 
     # Validate: at least one GFF input must be provided
     gff_inputs = [args.helixer, args.stringtie, args.transdecoder,
