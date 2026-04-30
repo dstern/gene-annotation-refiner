@@ -6580,12 +6580,9 @@ class GeneAnnotationRefiner:
             seqid, start, end, strand)
         if antisense is None:
             return True
-        if (antisense >= 1.0
-                and antisense >= 5.0 * max(sense, 0.1)
-                and antisense >= 0.20 * unstranded_mean):
+        if antisense >= 1.0 and antisense >= 5.0 * max(sense, 0.1):
             return False
-        # Insufficient stranded data, or antisense too small relative to
-        # unstranded — pass.
+        # Insufficient stranded data to call — pass.
         return True
 
     @staticmethod
