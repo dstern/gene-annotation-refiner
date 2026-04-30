@@ -70,25 +70,22 @@ available):
     genes on the opposite strand, supply same-strand bigwigs built only
     from stranded libraries:
 
-      --bigwig_fwd FILE   coverage of transcripts on the + strand
-      --bigwig_rev FILE   coverage of transcripts on the - strand
+      --bigwig_fwd FILE   reads mapping to the + strand of the genome
+      --bigwig_rev FILE   reads mapping to the − strand of the genome
 
-    Naming convention: these flags expect bigwigs labeled by TRANSCRIPT
-    strand, not read strand. Under dUTP-protocol libraries (TruSeq
-    Stranded, NEB Ultra II Directional, etc.) reads map to the genomic
-    strand OPPOSITE the originating transcript. Pipelines that split
-    bigwigs by read strand therefore produce files where:
+    Convention: these flags follow READ-strand labeling (the typical
+    output naming of bamCoverage and most stranded splitters, e.g.
+    *.forward.bw / *.reverse.bw). The pipeline assumes a dUTP-style
+    library protocol (TruSeq Stranded, NEB Ultra II Directional, most
+    modern stranded RNA-seq), where reads map to the genomic strand
+    OPPOSITE the originating transcript. The internal sense/antisense
+    lookup applies that flip automatically:
 
-      *forward.bw  (reads on + genomic strand) = − strand transcripts
-                                                  -> pass to --bigwig_rev
-      *reverse.bw  (reads on − genomic strand) = + strand transcripts
-                                                  -> pass to --bigwig_fwd
+      + strand gene's sense reads  =  reads on − genome strand  =  --bigwig_rev
+      − strand gene's sense reads  =  reads on + genome strand  =  --bigwig_fwd
 
-    deepTools handles the dUTP flip internally, so its outputs are
-    transcript-strand-labeled and pass through directly:
-      bamCoverage -b stranded.bam --filterRNAstrand forward -o plus_tx.bw
-      bamCoverage -b stranded.bam --filterRNAstrand reverse -o minus_tx.bw
-    -> --bigwig_fwd plus_tx.bw  --bigwig_rev minus_tx.bw
+    Just pass *.forward.bw to --bigwig_fwd and *.reverse.bw to --bigwig_rev
+    and the strand-mapping is handled correctly.
 
     Both flags must be provided together. When supplied, Phase 4.5
     (terminal-exon UTR extension) and Step 5g.5 (downstream-exon
@@ -2937,12 +2934,24 @@ class CoverageAccess:
 
 
 class StrandedCoverage:
-    """Optional same-strand coverage from forward/reverse bigwigs.
+    """Optional stranded coverage tracks for antisense vetoes.
 
-    Used to veto unstranded-coverage support that may actually be
-    antisense reads from a neighboring gene. Bigwigs are expected to be
-    keyed by transcript strand (e.g. produced via deepTools
-    `bamCoverage --filterRNAstrand forward/reverse`).
+    Bigwigs are expected to follow the convention used by deepTools
+    bamCoverage and most stranded splitters (read-strand-labeled, dUTP
+    library protocol):
+
+      --bigwig_fwd FILE   reads mapping to the + strand of the genome
+      --bigwig_rev FILE   reads mapping to the − strand of the genome
+
+    Under the dUTP protocol (TruSeq Stranded, NEB Ultra II Directional,
+    most modern stranded RNA-seq libraries), reads map as the reverse
+    complement of the original mRNA. So:
+
+      reads on + genome strand  =  − strand transcripts  →  bigwig_fwd
+      reads on − genome strand  =  + strand transcripts  →  bigwig_rev
+
+    The internal sense/antisense lookup applies that flip automatically:
+    a + strand gene's "sense" coverage comes from bigwig_rev, and so on.
     """
 
     def __init__(self, fwd_path: str = None, rev_path: str = None):
@@ -2951,17 +2960,19 @@ class StrandedCoverage:
         self.available = self.fwd is not None and self.rev is not None
 
     def sense_mean(self, seqid: str, start: int, end: int, strand: str) -> float:
-        """Mean same-strand coverage. Returns None if stranded data unavailable."""
-        if not self.available:
-            return None
-        bw = self.fwd if strand == '+' else self.rev
-        return bw.get_mean_coverage(seqid, start, end)
-
-    def antisense_mean(self, seqid: str, start: int, end: int, strand: str) -> float:
-        """Mean opposite-strand coverage. Returns None if stranded data unavailable."""
+        """Mean same-strand coverage (in transcript orientation).
+        Under dUTP, + strand transcripts come from reads on the − genome
+        strand, so query bigwig_rev for + strand genes."""
         if not self.available:
             return None
         bw = self.rev if strand == '+' else self.fwd
+        return bw.get_mean_coverage(seqid, start, end)
+
+    def antisense_mean(self, seqid: str, start: int, end: int, strand: str) -> float:
+        """Mean opposite-strand coverage (in transcript orientation)."""
+        if not self.available:
+            return None
+        bw = self.fwd if strand == '+' else self.rev
         return bw.get_mean_coverage(seqid, start, end)
 
     def close(self):
@@ -9214,20 +9225,23 @@ All GFF inputs are optional, but at least one of --helixer, --stringtie,
                              'as the primary coverage signal throughout the '
                              'pipeline.')
     parser.add_argument('--bigwig_fwd', default=None, nargs='+',
-                        help='Optional same-strand bigwig(s) for transcripts on '
-                             'the + strand (e.g. deepTools '
-                             '`bamCoverage --filterRNAstrand forward` from '
-                             'stranded libraries only). One or more files; '
-                             'values are summed. Used as a veto: if same-strand '
-                             'coverage is near-zero where the unstranded bigwig '
-                             'shows support, the support is rejected as '
+                        help='Stranded bigwig(s) of reads mapping to the + strand '
+                             'of the genome (typical *.forward.bw output of '
+                             'bamCoverage / stranded splitters). One or more '
+                             'files; values are summed. Used as a veto: if same-'
+                             'strand coverage is near-zero where the unstranded '
+                             'bigwig shows support, the support is rejected as '
                              'antisense leakage. Applied in Phase 4.5 '
                              '(terminal-exon UTR extension) and Step 5g.5 '
-                             '(downstream-exon recovery). Requires --bigwig_rev.')
+                             '(downstream-exon recovery). The pipeline assumes a '
+                             'dUTP-style stranded protocol: reads on the + '
+                             'genome strand are taken to come from − strand '
+                             'transcripts, and vice-versa. Requires --bigwig_rev.')
     parser.add_argument('--bigwig_rev', default=None, nargs='+',
-                        help='Same-strand bigwig(s) for transcripts on the − '
-                             'strand. One or more files; values are summed. '
-                             'Pairs with --bigwig_fwd.')
+                        help='Stranded bigwig(s) of reads mapping to the − strand '
+                             'of the genome (typical *.reverse.bw output). One '
+                             'or more files; values are summed. Pairs with '
+                             '--bigwig_fwd.')
     parser.add_argument('--bam', default=None, nargs='+',
                         help='RNA-seq BAM file(s) (optional, for splice junction '
                              'evidence). One or more files; junction read '
