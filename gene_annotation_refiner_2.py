@@ -2386,34 +2386,15 @@ def deduplicate_isoforms(transcripts: List['Transcript']) -> List['Transcript']:
 
 def trim_zero_coverage_terminal_exons(tx: 'Transcript', coverage: 'CoverageAccess',
                                        seqid: str, strand: str,
-                                       min_coverage: float = 1.0,
-                                       stranded_coverage=None) -> 'Transcript':
+                                       min_coverage: float = 1.0) -> 'Transcript':
     """Remove terminal exons (5' and 3' ends) that have no RNA-seq coverage.
 
     Works from each end inward, stopping at the first exon with coverage
     above min_coverage. Internal zero-coverage exons are NOT removed (they
     may be real exons with low expression).
-
-    When ``stranded_coverage`` is supplied (StrandedCoverage instance), an
-    exon's unstranded coverage is discounted to zero if antisense data
-    clearly dominates -- prevents an antisense neighbor from rescuing a
-    legitimately empty terminal exon.
     """
     if not tx.exons:
         return tx
-
-    def _effective_cov(start, end):
-        cov = coverage.get_mean_coverage(seqid, start, end)
-        if cov <= 0 or stranded_coverage is None or not getattr(
-                stranded_coverage, 'available', False):
-            return cov
-        sense = stranded_coverage.sense_mean(seqid, start, end, strand)
-        antisense = stranded_coverage.antisense_mean(seqid, start, end, strand)
-        if sense is None or antisense is None:
-            return cov
-        if antisense >= 1.0 and antisense >= 5.0 * max(sense, 0.1):
-            return 0.0
-        return cov
 
     sorted_exons = sorted(tx.exons, key=lambda e: e.start)
 
@@ -2424,7 +2405,8 @@ def trim_zero_coverage_terminal_exons(tx: 'Transcript', coverage: 'CoverageAcces
     # Trim from 5' end
     first_good = 0
     for i, exon in enumerate(sorted_exons):
-        if _effective_cov(exon.start, exon.end) >= min_coverage:
+        cov = coverage.get_mean_coverage(seqid, exon.start, exon.end)
+        if cov >= min_coverage:
             first_good = i
             break
     else:
@@ -2434,7 +2416,8 @@ def trim_zero_coverage_terminal_exons(tx: 'Transcript', coverage: 'CoverageAcces
     # Trim from 3' end
     last_good = len(sorted_exons) - 1
     for i in range(len(sorted_exons) - 1, -1, -1):
-        if _effective_cov(sorted_exons[i].start, sorted_exons[i].end) >= min_coverage:
+        cov = coverage.get_mean_coverage(seqid, sorted_exons[i].start, sorted_exons[i].end)
+        if cov >= min_coverage:
             last_good = i
             break
 
@@ -3307,29 +3290,12 @@ class GeneMerger:
     """Handle merging of gene models that should be combined."""
 
     def __init__(self, genome: GenomeAccess, coverage: CoverageAccess,
-                 bam_evidence=None, st_genes=None, tracer: 'GeneTracer' = None,
-                 stranded_coverage=None):
+                 bam_evidence=None, st_genes=None, tracer: 'GeneTracer' = None):
         self.genome = genome
         self.coverage = coverage
         self.bam = bam_evidence or NoBAMEvidence()
         self.st_genes = st_genes or []
         self.tracer = tracer or GeneTracer()
-        self.stranded_coverage = stranded_coverage
-
-    def _antisense_dominates(self, seqid: str, start: int, end: int,
-                              strand: str) -> bool:
-        """True if stranded data shows clear antisense dominance.
-        Returns False (no veto) when stranded data is unavailable or sparse."""
-        sc = self.stranded_coverage
-        if sc is None or not getattr(sc, 'available', False):
-            return False
-        sense = sc.sense_mean(seqid, start, end, strand)
-        if sense is None:
-            return False
-        antisense = sc.antisense_mean(seqid, start, end, strand)
-        if antisense is None:
-            return False
-        return antisense >= 1.0 and antisense >= 5.0 * max(sense, 0.1)
 
     def _trace_ev(self, msg: str, upstream: Gene, downstream: Gene) -> None:
         """Emit merge-evidence line as debug; also to trace log if pair matches."""
@@ -3517,16 +3483,6 @@ class GeneMerger:
             downstream_cov = self.coverage.get_mean_coverage(
                 upstream.seqid, downstream.start, min(downstream.start + 100, downstream.end))
             avg_gene_cov = (upstream_cov + downstream_cov) / 2.0
-
-            # Stranded antisense check: if the gap's unstranded coverage is
-            # actually from an antisense neighbor, ignore it as a bridge.
-            if gap_cov > 0 and self._antisense_dominates(
-                    upstream.seqid, gap_start, gap_end, upstream.strand):
-                gap_cov = 0.0
-                self._trace_ev(
-                    f"Merge: gap coverage discounted as antisense leakage "
-                    f"({upstream.gene_id} <-> {downstream.gene_id})",
-                    upstream, downstream)
 
             if avg_gene_cov > 1.0:
                 ratio = gap_cov / avg_gene_cov
@@ -4935,8 +4891,7 @@ class GeneAnnotationRefiner:
                                                   config=self.cfg,
                                                   evidence_index=self.evidence_index)
         self.merger = GeneMerger(self.genome, self.coverage, self.bam_evidence,
-                                 st_genes=self.st_genes, tracer=self.tracer,
-                                 stranded_coverage=self.stranded_coverage)
+                                 st_genes=self.st_genes, tracer=self.tracer)
         self.utr_recovery = UTRRecovery(self.genome, self.coverage,
                                          self.bam_evidence)
         self.splice_eval = SpliceSiteEvaluator(self.genome, self.coverage,
@@ -5243,8 +5198,7 @@ class GeneAnnotationRefiner:
             for tx in gene.transcripts:
                 if self.coverage.available:
                     tx = trim_zero_coverage_terminal_exons(
-                        tx, self.coverage, gene.seqid, gene.strand,
-                        stranded_coverage=self.stranded_coverage)
+                        tx, self.coverage, gene.seqid, gene.strand)
                     if self.tracer.matches(gene):
                         self.tracer.snapshot(
                             "  Step 5b.1 (trim zero-cov terminal)", [gene])
@@ -5786,17 +5740,11 @@ class GeneAnnotationRefiner:
                             gap_min = float(np.min(gap_cov))
 
                             if gap_mean > 50 and gap_min > 10:
-                                # Stranded antisense check: if the gap's
-                                # bridging coverage is from an antisense
-                                # neighbor, do not treat it as evidence to
-                                # merge two exons.
-                                if self._passes_strand_check(
-                                        seqid, gap_s, gap_e, strand, gap_mean):
-                                    prev_cov = self.coverage.get_mean_coverage(seqid, prev.start, prev.end)
-                                    curr_cov = self.coverage.get_mean_coverage(seqid, curr.start, curr.end)
-                                    flank_mean = (prev_cov + curr_cov) / 2
-                                    if gap_mean >= flank_mean * 0.3:
-                                        should_merge = True
+                                prev_cov = self.coverage.get_mean_coverage(seqid, prev.start, prev.end)
+                                curr_cov = self.coverage.get_mean_coverage(seqid, curr.start, curr.end)
+                                flank_mean = (prev_cov + curr_cov) / 2
+                                if gap_mean >= flank_mean * 0.3:
+                                    should_merge = True
                     except Exception:
                         pass
 
@@ -6632,9 +6580,12 @@ class GeneAnnotationRefiner:
             seqid, start, end, strand)
         if antisense is None:
             return True
-        if antisense >= 1.0 and antisense >= 5.0 * max(sense, 0.1):
+        if (antisense >= 1.0
+                and antisense >= 5.0 * max(sense, 0.1)
+                and antisense >= 0.20 * unstranded_mean):
             return False
-        # Insufficient stranded data to call — pass.
+        # Insufficient stranded data, or antisense too small relative to
+        # unstranded — pass.
         return True
 
     @staticmethod
@@ -7707,8 +7658,7 @@ class GeneAnnotationRefiner:
         for gene in selected:
             for tx in gene.transcripts:
                 tx = trim_zero_coverage_terminal_exons(
-                    tx, self.coverage, gene.seqid, gene.strand,
-                    stranded_coverage=self.stranded_coverage)
+                    tx, self.coverage, gene.seqid, gene.strand)
 
         consensus = selected
         self.tracer.snapshot("After Phase 5 (terminal exon trim)", consensus)
@@ -8811,8 +8761,7 @@ class GeneAnnotationRefiner:
             new_tx.exons = self._remove_noncanonical_exons(
                 gene.seqid, new_tx.exons, gene.strand)
             new_tx = trim_zero_coverage_terminal_exons(
-                new_tx, self.coverage, gene.seqid, gene.strand,
-                stranded_coverage=self.stranded_coverage)
+                new_tx, self.coverage, gene.seqid, gene.strand)
 
             new_gene = orf_finder.reassign_cds(
                 new_gene, coverage=self.coverage,
