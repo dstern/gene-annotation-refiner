@@ -1884,6 +1884,23 @@ class ORFFinder:
         n_exons = len(sorted_exons_fwd)
 
         # ── Coverage filter ────────────────────────────────────────────────
+        # Filters out spurious ATG candidates whose start lands in a low-
+        # coverage region. Evidence-supported starts (ATGs within tolerance
+        # of an annotated CDS start from Helixer/TD/StringTie) are exempt
+        # from this filter -- they carry stronger signal than coverage,
+        # which can spike at 3' ends and falsely strip a real 5' start.
+        EVIDENCE_TOL = 10
+        evidence_starts = set(evidence_cds_starts.keys()) if evidence_cds_starts else set()
+
+        def _is_evidence_supported(orf_start: int) -> bool:
+            if not evidence_starts:
+                return False
+            g_pos = self._tx_pos_to_genomic(
+                orf_start, sorted_exons_fwd, strand)
+            if g_pos is None:
+                return False
+            return any(abs(g_pos - ev) <= EVIDENCE_TOL for ev in evidence_starts)
+
         if coverage is not None and getattr(coverage, 'available', True):
             cov_scores = {}
             for orf_start, _, _ in candidates:
@@ -1901,7 +1918,8 @@ class ORFFinder:
             if max_cov > 0:
                 threshold = max_cov * COV_MIN_FRACTION
                 candidates = [c for c in candidates
-                               if cov_scores.get(c[0], 0.0) >= threshold]
+                              if cov_scores.get(c[0], 0.0) >= threshold
+                              or _is_evidence_supported(c[0])]
 
         if not candidates:
             return None
